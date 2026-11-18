@@ -264,6 +264,13 @@ struct Options {
     /// and the KV state, minus this reserve for the graphs, the hit scratch and the head.
     int vram_reserve_mib = 700;
     bool vram_reserve_given = false;   ///< --vram-reserve-mib on the command line (--glm-pack: a small card's default gives way)
+    /// Phase 3's peer expert tier (`--peer IP`): run `strata-peer` on that machine over a copy of this pack and a
+    /// decode miss that neither VRAM nor this machine's RAM tier holds is pulled off the peer's slab over RoCE
+    /// instead of from the local disk.  `peer_port` is the daemon's control port (`--port`, default 9447),
+    /// `peer_device` the local ibverbs device (empty: the first one).  Empty: off (the disk path, unchanged).
+    std::string peer;
+    int peer_port = 9447;
+    std::string peer_device;
     /// `--vram-reserve-later-mib N` (--glm-pack): the reserve on a layer split's later GPUs (empty: --vram-reserve-mib's);
     /// one number for every later GPU, or a comma list for the parts 1, 2, ... in order (its last value repeating)
     std::string vram_reserve_later;
@@ -393,6 +400,12 @@ void usage() {
                  "                       or lower --max-context). Env: MAYA_GLM_RAM_RESIDENT=1\n"
                  "  --glm-ram-slack N    extra RAM-tier slots per MoE layer (MAYA_GLM_RAM_SLACK; default 16 when\n"
                  "                       resident, 0 otherwise)\n"
+                 "  --peer IP            (--glm-pack) pull misses off a peer's RAM over RoCE instead of the local disk:\n"
+                 "                       run strata-peer --pack <a copy of this pack> on IP and give this machine's\n"
+                 "                       ibverbs device (--peer-device, default the first) and the daemon's port\n"
+                 "                       (--peer-port, default 9447).  A peer that dies mid-decode is sticky: the\n"
+                 "                       disk path answers every miss from then on (the same tokens, only slower).\n"
+                 "                       Env: MAYA_GLM_PEER / _PORT / _DEVICE; off by default\n"
                  "  --parallel N         --serve: up to N requests decode at once (1-8, default 1). One GPU decodes\n"
                  "                       them together (each weight read once for all); a split pipelines them\n"
                  "                       across its cards. Each extra conversation keeps its own context state\n"
@@ -1103,6 +1116,18 @@ static int glm_pack_generate(const Options& o) {
     if (!o.prefill_arg.empty()) set_env("STRATA_GLM_PREFILL", o.prefill_arg.c_str());
     // the DFlash2 drafter (--dflash, else STRATA_GLM_DFLASH): loaded with the model, on the device of its head
     if (!o.dflash.empty()) set_env("STRATA_GLM_DFLASH", o.dflash.c_str());
+    // Phase 3's peer expert tier (--peer IP): the engine reads STRATA_GLM_PEER* and the docs say MAYA_GLM_PEER*,
+    // so both names are set - the engine tries its own first.  Unset: no session, no MRs, the disk path as before
+    if (!o.peer.empty()) {
+        set_env("STRATA_GLM_PEER", o.peer.c_str());
+        set_env("MAYA_GLM_PEER", o.peer.c_str());
+        set_env("STRATA_GLM_PEER_PORT", std::to_string(o.peer_port).c_str());
+        set_env("MAYA_GLM_PEER_PORT", std::to_string(o.peer_port).c_str());
+        if (!o.peer_device.empty()) {
+            set_env("STRATA_GLM_PEER_DEVICE", o.peer_device.c_str());
+            set_env("MAYA_GLM_PEER_DEVICE", o.peer_device.c_str());
+        }
+    }
     // --spec-follow / --spec-follow-save (else STRATA_GLM_SPEC_FOLLOW / _SAVE): read below, once the vocabulary is known
     if (!o.spec_follow.empty()) set_env("STRATA_GLM_SPEC_FOLLOW", o.spec_follow.c_str());
     if (!o.spec_follow_save.empty()) set_env("STRATA_GLM_SPEC_FOLLOW_SAVE", o.spec_follow_save.c_str());
@@ -4732,6 +4757,9 @@ int main(int argc, char** argv) {
             o.vram_reserve_given = true;
         }
         else if (a == "--vram-reserve-later-mib") o.vram_reserve_later = next("--vram-reserve-later-mib");
+        else if (a == "--peer") o.peer = next("--peer");
+        else if (a == "--peer-port") o.peer_port = std::atoi(next("--peer-port"));
+        else if (a == "--peer-device") o.peer_device = next("--peer-device");
         else if (a == "--prefill") {
             const std::string v = next("--prefill");
             o.prefill_arg = v;
@@ -4895,6 +4923,10 @@ int main(int argc, char** argv) {
                 if (comma == std::string::npos) break;
                 pos = comma + 1;
             }
+        }
+        if (!o.peer.empty() && (o.peer_port <= 0 || o.peer_port > 65535)) {
+            std::fprintf(stderr, "maya generate: --peer-port takes a TCP port (the daemon's default is 9447)\n");
+            return 2;
         }
         if ((o.vram_reserve_given && o.vram_reserve_mib < 0) || !later_ok) {
             std::fprintf(stderr, "maya generate: --vram-reserve-mib and --vram-reserve-later-mib take 0 or more MiB, "

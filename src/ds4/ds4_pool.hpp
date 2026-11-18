@@ -193,6 +193,15 @@ public:
         const uint64_t seen = done_;
         done_cv_.wait_for(lk, std::chrono::microseconds(us), [&] { return done_ != seen; });
     }
+    /// (the peer tier) the jobs it took off this queue have finished on its own worker: the flow's wait after it
+    /// queued them must not sit out the whole timeout.  Wakes wait_any as one finished job would.
+    void notify_done() {
+        {
+            std::lock_guard<std::mutex> lk(done_mu_);
+            ++done_;
+        }
+        done_cv_.notify_all();
+    }
     double busy_ms() const { return busy_us_.load(std::memory_order_relaxed) / 1000.0; }
     uint64_t direct_bytes() const { return direct_.load(std::memory_order_relaxed); }
     uint64_t buffered_bytes() const { return buffered_.load(std::memory_order_relaxed); }

@@ -1093,6 +1093,43 @@ To measure it against the page cache (one model, the same prompts, both ways): a
 cache emptied before each run, `--n` decodes of the same prompts with and without `--ssd-cache auto`, comparing decode
 tok/s, `decode reads from the disk` and the `RAM store` line.
 
+## Two machines: the other machine's experts over RoCE (opt-in, unmeasured end to end)
+
+A pack that neither machine could hold alone can be split across two: `strata-peer` runs beside the second machine's
+disks and serves the shard files it holds, the engine pulls the expert matrices its routing misses over RDMA instead of
+reading them from a disk that does not have them. The bytes land in the engine's own pinned staging and are copied into
+VRAM the usual way, so this changes where a matrix comes from, never what the arithmetic does with it - a peer that is
+not there leaves the run reading that slice locally, as it always did.
+
+The transport is RoCE (or InfiniBand) over ibverbs, not TCP: both sides create their queue pair by hand and exchange
+`{qpn, psn, gid}` over a small control channel, because `rdma_cm`'s accept path builds a `REMOTE_WRITE`-only pair and
+NAKs the READs this is made of. Building `strata-peer` is part of the normal build whenever ibverbs is installed;
+without it `--peer` does nothing. The daemon, the bring-up recipe and the transport's details are in
+[RDMA_PEER_TIER.md](RDMA_PEER_TIER.md), which is the reference for this section; the settings are:
+
+| Setting | Default | |
+| --- | --- | --- |
+| `--peer <host>` (or `MAYA_GLM_PEER` / `MAYA_DS4_PEER`) | off | the daemon's host, and the tier is on; empty: as before, every expert from this machine's files |
+| `--peer-port` (`_PORT`) | 9447 | the daemon's control channel (`--port` there); the data channel is the queue pair, not a port |
+| `--peer-device` (`_DEVICE`) | the first device found | the ibverbs device to use (`rocep7s0`, `rocep198s0`, ...); it prints the GID it picked |
+| `--peer-shards` | the whole pack | DeepSeek only: the pack files **the peer holds**, by the pack's own numbering (`maya-ds4 --pack-info` lists them). An expert in any other shard is read from this machine's disk, so a 341 GB pack can have shards 2 and 3 on a peer with 214 GB free |
+| `_WINDOW` | 48 | outstanding posts; posting faster than the completions come back ends in `ENOSPC` on `ibv_post_send` |
+| `_CHUNK_MB` | 2 | the size of one posted READ; below the link's MTU this is bandwidth per completion, above it bandwidth per chunk queued |
+| `_TIMEOUT_MS` | 1000 | how long a batch waits for its completions before the session counts as down |
+| `strata-peer --vram <gpu>:<gb>` (repeatable; `PEER_VRAM` in `./peer-tier.sh`, `0:14` there) | off (the daemon); `./peer-tier.sh` passes `0:14` | the **daemon's** own VRAM tier: that GPU's memory, held as a dmabuf MR and served straight to the engine's NIC instead of coming out of the pinned RAM slab. Start-up-fatal when the card cannot give the bytes or the NIC cannot register them; rows it cannot hold spill into the RAM slab |
+
+What it does not cover: only the experts' read path. DeepSeek's RAM-tier copies, the layer cache and the shared down
+read of a `DS4_FLOW_DOWN_SHARE` prompt keep their own bookkeeping and stay local; GLM's **prompt** reads stay on the
+disk path (its decode path is the one that pulls from the peer). It is one peer and one session, with no reattach: a
+dead session stays dead for the run and every later miss is a local read (`THE PEER IS DOWN`, printed once). Nothing
+is written back to the peer, and there is no GPU-direct on this side - the bytes pass through pinned host staging on
+their way into the engine's cards (the peer's side can be `--vram`, see the table).
+
+On our link (two ConnectX-4 Lx, MTU 4096) an RDMA READ of 2 MiB messages measures 24.5 Gb/s, about 3 GB/s. What that
+is worth to a decode has not been measured yet: the lane it replaces is the SSD's, and the staging copy into VRAM
+happens either way, so compare `decode reads from the disk` and the engine's `ds4 peer: N rows ... (y GB/s on the
+wire)` line against the same prompts served from local shards before trusting a number.
+
 ## DeepSeek: explicit RAM residency
 
 These independent settings are off by default. They are for Linux hosts with enough physical RAM to hold the

@@ -35,6 +35,7 @@
 #include "ds4_pcie.hpp"
 #include "ds4_q6k.cuh"
 #include "ds4_pool.hpp"
+#include "ds4_peer_tier.hpp"   // (Phase 3's peer expert tier: the flow reads a staging slot's bytes over RoCE)
 #include "ds4_path_policy.hpp"
 #include "ds4_place.hpp"
 #include "ds4_prefill_stats.hpp"
@@ -690,6 +691,9 @@ struct Dev {
 // A queries, the indexer in slabs of AI), its GEMMs through FP16 reconstructions of the weights and cuBLAS
 
 struct Chunk {
+    // (--peer-compute) the most tokens one peer order carries: a decode's row count a job is the daemon's framing
+    // limit (peer_compute_hip.cpp's kMaxRows), so a window of more tokens keeps the lane's own arithmetic
+    static constexpr int kPcMaxTokens = 8;
     int C = 0, A = 0, AI = 0;
     int AIM = 0;   // the indexer's slab rows at most (its q and block maps): AI rows of the context's width fit its scores
     int HQ = 0, OG = 0, FF = 0;              // (lay_chunk: this device's heads' width, wo_a groups, FFN share)
@@ -790,6 +794,8 @@ struct Chunk {
                                              //  one copy, its member's columns then gathered into the ring slot)
     int dev = -1;                            // the device (index into devs) this chunk state belongs to
     std::unique_ptr<IoQueue> io;
+    std::unique_ptr<PeerQueue> peerq;   // (--peer: the orders this stage's reads go over the wire instead; declared
+                                       //  after io, so its thread is joined before the queue those read from)
     std::deque<Item> items;                  // items[0] is item `base`; the indices below are absolute
     size_t base = 0, n_read = 0, n_dma = 0, n_comp = 0;
     uint64_t n_file = 0;                     // file items so far (staging slot = ordinal % S)
@@ -1085,6 +1091,15 @@ struct WinPlan {
 // ------------------------------------------------------------------ the model
 struct Model::Impl {
     Options o;
+    // (--peer-compute) the tier's compute half: the session whose worker sums the experts it holds, and whether this
+    // run takes it (read at load from PeerTier::compute_on - a storage-only session leaves both as they are)
+    bool pc_on = false;
+    PeerTier* pc_tier = nullptr;   // (the session pc_on came from: the decode lane's serve_lane asks it to compute)
+    /// (--peer-compute) the layers the decode lane may hand over: a layer this machine runs whole (a tensor-parallel
+    /// group's rows are its members' arithmetic), never the draft block, and one the peer's own layout names at all
+    bool pc_layer_ok(const Layer& l) const {
+        return pc_tier != nullptr && l.nm == 1 && !l.mtp && l.n_exp > 0 && pc_tier->row_of(l.il, 0, 0) >= 0;
+    }
 #if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
     std::atomic<bool> peer_ar_failed{false}; // sticky across reset: reload after a transport failure
 #endif
@@ -4794,6 +4809,134 @@ struct Model::Impl {
                 // whole down of every expert it streams, 25 MB an expert for a pair, 18.8 alone - 3x V100, the
                 // 17-token prompt from the page cache: 2.5-2.7 s on the flow, 1.3-1.6 s in the group's windows)
                 const bool flow_tp = std::getenv("DS4_FLOW_TP") != nullptr && std::atoi(std::getenv("DS4_FLOW_TP")) != 0;
+                // (Phase 3) THE PEER EXPERT TIER: --peer names the other machine's strata-peer, --peer-shards the pack
+                // files IT holds (a pack larger than its RAM is not there whole; empty: all of them).  Every MXFP4
+                // layer's three matrices become rows (expert e's part is [mx_off + e * mx_stride, + mx_part_bytes)) of
+                // the MANIFEST's names, so a shard this machine keeps for itself simply has no rows and its experts are
+                // read here.  A session that cannot be brought up, or a staging buffer the NIC will not register, is
+                // said once and every read then goes the local way - the run is the same, only slower.
+                PeerTier* ptier = nullptr;
+                {
+                    auto env = [](const char* a, const char* b) -> const char* {   // (the newer name, its alias)
+                        const char* v = std::getenv(a);
+                        return v != nullptr ? v : std::getenv(b);
+                    };
+                    std::string phost = o.peer;
+                    if (phost.empty() && env("STRATA_DS4_PEER", "MAYA_DS4_PEER") != nullptr)
+                        phost = env("STRATA_DS4_PEER", "MAYA_DS4_PEER");
+                    if (!phost.empty()) {
+                        PeerTier::Config c;
+                        c.host = phost;
+                        c.port = o.peer_port > 0 ? o.peer_port : (env("STRATA_DS4_PEER_PORT", "MAYA_DS4_PEER_PORT") != nullptr
+                                                                     ? std::atoi(env("STRATA_DS4_PEER_PORT", "MAYA_DS4_PEER_PORT"))
+                                                                     : 9447);
+                        c.device = !o.peer_device.empty() ? o.peer_device
+                                                          : (env("STRATA_DS4_PEER_DEVICE", "MAYA_DS4_PEER_DEVICE") != nullptr
+                                                                 ? env("STRATA_DS4_PEER_DEVICE", "MAYA_DS4_PEER_DEVICE")
+                                                                 : "");
+                        if (env("STRATA_DS4_PEER_WINDOW", "MAYA_DS4_PEER_WINDOW") != nullptr)
+                            c.window = std::max(1, std::atoi(env("STRATA_DS4_PEER_WINDOW", "MAYA_DS4_PEER_WINDOW")));
+                        if (env("STRATA_DS4_PEER_CHUNK_MB", "MAYA_DS4_PEER_CHUNK_MB") != nullptr)
+                            c.chunk_mb = std::max(1, std::atoi(env("STRATA_DS4_PEER_CHUNK_MB", "MAYA_DS4_PEER_CHUNK_MB")));
+                        if (env("STRATA_DS4_PEER_TIMEOUT_MS", "MAYA_DS4_PEER_TIMEOUT_MS") != nullptr)
+                            c.timeout_ms =
+                                std::max(1, std::atoi(env("STRATA_DS4_PEER_TIMEOUT_MS", "MAYA_DS4_PEER_TIMEOUT_MS")));
+                        c.pack_dir = pk.model_dir;
+                        std::vector<int> pos_of(pk.files.size(), -1);   // (pack file -> the manifest's index)
+                        std::vector<int> order;                          // (the manifest's files, in the order asked)
+                        bool bad_shard = false;
+                        // (--peer-shards has an environment name like the rest of the tier's settings: a start
+                        // that only sets the address - a dashboard, a script - can say what the peer holds too)
+                        std::vector<int> shards = o.peer_shards;
+                        if (shards.empty() && env("STRATA_DS4_PEER_SHARDS", "MAYA_DS4_PEER_SHARDS") != nullptr) {
+                            const char* sp = env("STRATA_DS4_PEER_SHARDS", "MAYA_DS4_PEER_SHARDS");
+                            while (*sp != '\0') {
+                                char* end = nullptr;
+                                const long v = std::strtol(sp, &end, 10);
+                                if (end == sp) break;
+                                shards.push_back((int) v);
+                                sp = end;
+                                while (*sp == ',' || *sp == ' ') ++sp;
+                            }
+                        }
+                        if (shards.empty())
+                            for (size_t i = 0; i < pk.files.size(); ++i) order.push_back((int) i);
+                        else
+                            for (int idx : shards) {
+                                if (idx < 0 || (size_t) idx >= pk.files.size()) bad_shard = true;
+                                else if (std::find(order.begin(), order.end(), idx) == order.end())
+                                    order.push_back(idx);
+                            }
+                        if (bad_shard) {
+                            std::fprintf(stderr, "ds4 peer: --peer-shards names a pack file this one does not have (it"
+                                                 " has %zu) - the tier is not used\n", pk.files.size());
+                        } else {
+                            // (the pack's tensor list names files BESIDE the model dir too - ../dspark/dspark.bin,
+                            // ../vision/vision.bin - and a manifest name is resolved as <pack dir>/<name> on the
+                            // peer: such a file is no shard it holds, and sending it would fail the fingerprint of
+                            // the six it does.  Only a plain name that is a file under the model dir goes in.)
+                            std::vector<int> kept;
+                            size_t skipped = 0;
+                            for (int idx : order) {
+                                const std::string& fn = pk.files[(size_t) idx];
+                                const bool plain = !fn.empty() && fn.find_last_of("/\\") == std::string::npos;
+                                if (plain && std::filesystem::is_regular_file(pk.model_dir + "/" + fn)) {
+                                    kept.push_back(idx);
+                                    continue;
+                                }
+                                ++skipped;
+                                if (std::find(shards.begin(), shards.end(), idx) != shards.end())
+                                    std::fprintf(stderr, "ds4 peer: --peer-shards names pack file %d (%s), which is "
+                                                         "not a file under %s - the peer cannot hold it\n", idx,
+                                                 fn.c_str(), pk.model_dir.c_str());
+                            }
+                            order = kept;
+                            if (order.empty())
+                                std::fprintf(stderr, "ds4 peer: not used (no pack file of this pack is a file under"
+                                                     " %s) - every expert is read on this machine's disks\n",
+                                             pk.model_dir.c_str());
+                            else if (skipped > 0 && o.verbose)
+                                std::fprintf(stderr, "ds4 peer: %zu of %zu pack files stay off the wire (they are"
+                                                     " beside the model dir: no expert rows)\n", skipped,
+                                             pk.files.size());
+                            for (size_t k = 0; k < order.size(); ++k) {
+                                pos_of[(size_t) order[k]] = (int) k;
+                                c.shard_names.push_back(pk.files[(size_t) order[k]]);
+                                c.shard_sizes.push_back(os::file_size(pk.fds[(size_t) order[k]]));
+                            }
+                            if (!c.shard_names.empty()) {
+                                c.layers.reserve(L.size());
+                                for (const Layer& l : L) {
+                                    PeerLayerSpec ls;
+                                    if (!l.mtp && l.lay.fmt == gg::kFmtMXFP4 && l.n_exp > 0) {
+                                        ls.n_exp = l.n_exp;
+                                        for (int r = 0; r < 3; ++r) {
+                                            if (l.mx_file[r] < 0) continue;
+                                            const int pos = pos_of[(size_t) l.mx_file[r]];
+                                            const size_t bytes = mx_part_bytes(l, r);
+                                            if (pos < 0 || bytes == 0 || bytes > UINT32_MAX) continue;   // (this shard, here)
+                                            ls.part[r] = PeerRowSpec{pos, l.mx_off[r], l.mx_stride[r], (uint32_t) bytes};
+                                        }
+                                    }
+                                    c.layers.push_back(ls);
+                                }
+                                std::string perr;
+                                ptier = PeerTier::open_session(c, perr);
+                                pc_on = ptier != nullptr && ptier->compute_on();
+                                pc_tier = pc_on ? ptier : nullptr;
+                                if (ptier == nullptr)
+                                    std::fprintf(stderr, "ds4 peer: not used (%s) - every expert this run misses is"
+                                                         " read on this machine's disks\n", perr.c_str());
+                                else if (o.verbose)
+                                    std::fprintf(stderr, "ds4 peer: %zu of %zu pack files on %s (%zu layers of rows)\n",
+                                                 c.shard_names.size(), pk.files.size(), phost.c_str(),
+                                                 (size_t) std::count_if(L.begin(), L.end(), [](const Layer& l) {
+                                                     return !l.mtp && l.lay.fmt == gg::kFmtMXFP4 && l.n_exp > 0;
+                                                 }));
+                            }
+                        }
+                    }
+                }
                 for (size_t di = 0; di < chunks.size(); ++di) {
                     auto& cp = chunks[di];
                     if (cp == nullptr || cp->ring == nullptr) continue;
@@ -4821,6 +4964,8 @@ struct Model::Impl {
                     cp->flow = true;
                     cp->dev = (int) di;
                     cp->io = std::make_unique<IoQueue>(n_readers);
+                    if (ptier != nullptr && ptier->register_dst(cp->stage, (size_t) cp->S * cp->stage_stride))
+                        cp->peerq = std::make_unique<PeerQueue>(*ptier, *cp->io);   // (joined before its queue, above)
                     cp->stage_item.assign((size_t) cp->S, -1);
                     cp->stage_ev.resize((size_t) cp->S);
                     cp->ring_fill.resize((size_t) cp->ring_n);
@@ -6413,6 +6558,7 @@ struct Model::Impl {
     bool flow_pump(Chunk& c, std::string& err) {
         const size_t end = c.base + c.items.size();
         IoQueue::Job jobs[3 * kMaxNH];   // (3 matrices, each from up to kMaxNH copy parts)
+        PeerQueue::Order porders[3 * kMaxNH];   // (--peer: this one item's file parts, offered to the tier)
         while (c.n_read < end) {
             Chunk::Item& it = fit(c, c.n_read);
             if (it.after >= 0) {   // layer-major: a slot's expert copied out of it once its reader is done; a slot
@@ -6444,7 +6590,7 @@ struct Model::Impl {
                 //  same bytes, no read - and pinned until the copy has landed; DS4_STORE_FLOW=0: read as before)
                 if (store_flow && it.ram == nullptr && it.hsrc == nullptr && it.keep == nullptr && store_reads(l, it.e))
                     it.sto = store->acquire(l.il, it.e);
-                int nj = 0;
+                int nj = 0, npo = 0;   // (both per item: an item's orders are pushed once, never carried on)
                 for (int r = 0; r < 3; ++r) {
                     if (it.sto >= 0) {
                         IoQueue::Job& j = jobs[nj++];
@@ -6503,8 +6649,8 @@ struct Model::Impl {
                         sb += flow_region(r);
                         continue;
                     }
-                    IoQueue::Job& j = jobs[nj++];
-                    j = IoQueue::Job{};   // (a job before it in jobs may have been one of the pool's copies)
+                    IoQueue::Job j;   // (a job before it in jobs may have been one of the pool's copies)
+                    j = IoQueue::Job{};
                     const os::fd_t pf = pk.pfds.empty() ? os::kBadFd : pk.pfds[(size_t) l.mx_file[r]];
                     j.fd = pf != os::kBadFd ? pf : pk.fds[(size_t) l.mx_file[r]];
                     j.dfd = pk.dfds.empty() || c.buffered ? os::kBadFd : pk.dfds[(size_t) l.mx_file[r]];
@@ -6526,10 +6672,28 @@ struct Model::Impl {
                         down_cut(l, it.mi, j.cpitch, j.coff, j.clen);
                         j.crows = (size_t) g.dim;
                     }
+                    // (--peer) a plain file read into this staging slot: offered to the peer tier, whose own thread
+                    // pulls it over RoCE and hands this exact job back to the local queue whenever the wire does not
+                    // deliver it - a RAM-tier copy through staging, the layer cache and DS4_FLOW_DOWN_SHARE's shared
+                    // down read (all of which keep their bytes or account them) stay on the disk path
+                    const long long prow = c.peerq != nullptr && j.mem == nullptr && j.keep == nullptr &&
+                                                   j.share == nullptr && j.len > 0
+                                               ? c.peerq->row_of((int64_t) it.il, (int64_t) it.e, r)
+                                               : -1;
+                    if (prow >= 0) {
+                        PeerQueue::Order& po = porders[npo++];
+                        po.job = j;
+                        po.row = prow;
+                        po.rel = mx_read_off(l, it.mi, r);
+                        po.bytes = (size_t) j.len;
+                    } else {
+                        jobs[nj++] = j;
+                    }
                     sb += flow_region(r);
                 }
                 if (cs >= 0) it.left.store(nj, std::memory_order_relaxed);   // (a member's rows: maybe fewer parts)
-                c.io->push(jobs, nj);
+                if (nj > 0) c.io->push(jobs, nj);
+                if (npo > 0) c.peerq->push(porders, npo);
             }
             ++c.n_read;
         }
@@ -15106,6 +15270,18 @@ struct Model::Impl {
         bool deep = false;
         std::vector<Ent> ents, hents;
         std::vector<std::pair<int, int>> hpicks;   // (expert, t * kPicks + i), the helper's
+        // (--peer-compute) a request's peer orders: the experts this lane hands to the other machine, one order each,
+        // its rows the picks' tokens - their x rows rounded here (the lane's are on the host already), their sums back
+        // here.  Reused request after request (this thread's alone; the tier is process-wide)
+        struct PcOrd {
+            int e = -1, row0 = 0, n = 0;
+            long long r[3] = {-1, -1, -1};
+            int pick[kWin * kPicks] = {};   // t * kPicks + i, the order's rows in this vector's order
+        };
+        std::vector<PcOrd> pc_ords;
+        std::vector<char> pc_ok;
+        std::vector<int8_t> pc_q;
+        std::vector<float> pc_d, pc_y;
         while (!quit.load(std::memory_order_relaxed)) {
             if (deep) gate_seen = gate.epoch();   // (before the look at the ring: a poke after it ends the sleep at once)
             Req& r = reqs[next % kRing];
@@ -15248,7 +15424,70 @@ struct Model::Impl {
                     if (T == 1) lane_take(l, ln_cls[(size_t) lc], picks, lt, next, r.ids);
                     else lane_take_win(l, ln_cls[(size_t) lc], picks, lt, next, r.ids, T);
                 }
-                std::sort(picks.begin(), picks.end());
+                // (--peer-compute) THE PICKS THE PEER HOLDS leave this lane: an expert whose three rows the session
+                // holds is one order (its rows the picks' tokens), summed on the other machine, and its weighted sum is
+                // added where this lane's would have been.  A refusal - a row evicted, a session that died, geometry a
+                // worker will not take - puts the picks straight back here and they are computed as always: a peer's
+                // no may cost a lane's time, never an expert's contribution.
+                pc_ords.clear();
+                const bool pc_here = pc_on && pc_tier != nullptr && !l.mtp && T <= Chunk::kPcMaxTokens && pc_layer_ok(l) &&
+                                     !(lane_par && lane_par_layer(l));
+                if (pc_here && !picks.empty()) {
+                    std::vector<std::pair<int, int>> mine;
+                    for (size_t a = 0; a < picks.size();) {
+                        const int e = picks[a].first;
+                        size_t b = a;
+                        while (b < picks.size() && picks[b].first == e) ++b;
+                        int used = 0;
+                        for (const PcOrd& o : pc_ords) used += o.n;
+                        if ((b - a) <= (size_t) (kWin * kPicks - used) && pc_tier->computable((int64_t) li, (int64_t) e)) {
+                            PcOrd o;
+                            o.e = e;
+                            o.row0 = used;
+                            o.n = (int) (b - a);
+                            for (int r = 0; r < 3; ++r) o.r[r] = pc_tier->row_of((int64_t) li, (int64_t) e, r);
+                            for (int q = 0; q < o.n; ++q) o.pick[q] = picks[a + (size_t) q].second;
+                            pc_ords.push_back(o);
+                        } else
+                            for (size_t q = a; q < b; ++q) mine.push_back(picks[q]);
+                        a = b;
+                    }
+                    picks.swap(mine);
+                }
+                if (!pc_ords.empty()) {
+                    const int E = g.dim, FD = g.ff, DD = E / 32;
+                    int rows = 0;
+                    for (const PcOrd& o : pc_ords) rows += o.n;
+                    pc_q.resize((size_t) rows * (size_t) E);
+                    pc_d.resize((size_t) rows * (size_t) DD);
+                    pc_y.resize((size_t) rows * (size_t) E);
+                    std::vector<long long> prow;
+                    std::vector<int> pn;
+                    std::vector<const int8_t*> pxq;
+                    std::vector<const float*> pxd;
+                    std::vector<float*> py;
+                    for (const PcOrd& o : pc_ords) {
+                        for (int q = 0; q < o.n; ++q) {   // (a row a pick: its token's x, rounded as a row of its own is)
+                            const int t = o.pick[q] / kPicks;
+                            gg::q8_quant_row_host(&r.x[t][0], E, pc_q.data() + (size_t) (o.row0 + q) * (size_t) E,
+                                                  pc_d.data() + (size_t) (o.row0 + q) * (size_t) DD);
+                        }
+                        prow.push_back(o.r[0]), prow.push_back(o.r[1]), prow.push_back(o.r[2]);
+                        pn.push_back(o.n);
+                        pxq.push_back(pc_q.data() + (size_t) o.row0 * (size_t) E);
+                        pxd.push_back(pc_d.data() + (size_t) o.row0 * (size_t) DD);
+                        py.push_back(pc_y.data() + (size_t) o.row0 * (size_t) E);
+                    }
+                    pc_ok.assign(pc_ords.size(), 0);
+                    pc_tier->compute_rows((int) pc_ords.size(), prow.data(), pn.data(), E, FD, gg::expert_type(l.lay, 0),
+                                          gg::expert_type(l.lay, 2), g.lim, pxq.data(), pxd.data(), nullptr, py.data(),
+                                          pc_ok.data());
+                    for (size_t k = 0; k < pc_ords.size(); ++k)   // (a no: this lane's entries, as they always were)
+                        if (pc_ok[k] == 0)
+                            for (int q = 0; q < pc_ords[k].n; ++q)
+                                picks.push_back({pc_ords[k].e, pc_ords[k].pick[q]});
+                    if (picks.size() > 1) std::sort(picks.begin(), picks.end());
+                }
                 for (size_t a = 0; a < picks.size();) {
                     Ent en;
                     en.e = picks[a].first;
@@ -15321,6 +15560,24 @@ struct Model::Impl {
                     st.cpu_ms += now_ms() - tc;
                     st.cpu_experts += nslots;
                     if (l.mtp) st.draft_cpu += nslots;
+                }
+                if (!pc_ords.empty()) {   // (the peer's sums: weighted as this lane weights its own, into the same part)
+                    const int E = g.dim;
+                    for (size_t k = 0; k < pc_ords.size(); ++k) {
+                        if (pc_ok[k] == 0) continue;
+                        const PcOrd& o = pc_ords[k];
+                        for (int q = 0; q < o.n; ++q) {
+                            const int t = o.pick[q] / kPicks, i = o.pick[q] % kPicks;
+                            if (rp.cpu[t] == 0) {   // (this token's part is nothing but the peer's sums so far)
+                                for (int e = 0; e < E; ++e) rp.part[t][e] = 0.0f;
+                                rp.cpu[t] = 1;
+                            }
+                            const float wq = r.w[t][i];
+                            const float* y = pc_y.data() + (size_t) (o.row0 + q) * (size_t) E;
+                            float* part = rp.part[t];
+                            for (int e = 0; e < E; ++e) part[e] += wq * y[e];
+                        }
+                    }
                 }
                 if (lc >= 0) lane_answer(ln_cls[(size_t) lc], lt);
                 if (hon) {

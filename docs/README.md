@@ -47,3 +47,6 @@ How the engine works and how changes were measured. You do not need these to run
 - [EXL3_HIP_SCALAR_ROWS.md](EXL3_HIP_SCALAR_ROWS.md): configurable scalar EXL3 prompt tiles on RDNA4.
 - [EXL3_RDNA4.md](EXL3_RDNA4.md): matrix-instruction EXL3 prefill on RDNA4 (`EXL3_WMMA_GFX12`).
 - [HIP_PEER_PREFILL.md](HIP_PEER_PREFILL.md): how startup picks the HIP prompt transport between two GPUs.
+- [RDMA_PEER_TIER.md](RDMA_PEER_TIER.md): the two-machine peer expert tier (`strata-peer`, `--peer`): RDMA READ over RoCE, and the local fallback it keeps.
+- [PEER_TIER_RUNBOOK.md](PEER_TIER_RUNBOOK.md): starting a tiered run on the two machines, and the terminal commands that put the normal host back if it does not come up.
+- [PEER_COMPUTE.md](PEER_COMPUTE.md): the peer's cards and cores as a *compute* tier - what stage 0 measured there (µs per expert, the wire's latency), and the design and stages for serving compute orders. Measured, not built.

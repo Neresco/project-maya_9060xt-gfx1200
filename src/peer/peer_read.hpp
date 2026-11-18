@@ -13,8 +13,19 @@
 #include "peer_rdma.hpp"
 
 #include <cstdint>
+#include <vector>
 
 namespace strata::peer {
+
+/// One piece of a batched pull: [src_addr, + bytes) of the peer's registered slab into [dst_mr->addr +
+/// dst_off, ...) on this side.  A row's parts are separate requests, so a layer's rows share a window.
+struct ReadReq {
+    uint64_t src_addr = 0;
+    uint32_t src_rkey = 0;
+    ibv_mr* dst_mr = nullptr;
+    uint64_t dst_off = 0;
+    size_t bytes = 0;
+};
 
 /// A chunked RDMA READ of [src_addr, src_addr + bytes) (the peer's registered slab, rkey) into
 /// [dst + dst_off, ...) (this side's registered MR).  Returns false on any completion error,
@@ -30,6 +41,14 @@ public:
 
     bool read(uint64_t src_addr, uint32_t src_rkey, ibv_mr* dst_mr, uint64_t dst_off, size_t bytes,
               int timeout_ms, std::string& err);
+
+    /// **THE DECODE PATH'S SHAPE: MANY ROWS AT ONCE.**  A layer routes ten experts and each is three
+    /// parts of one to a few MB, so one row at a time is a round trip per part - latency-bound, the
+    /// window idle.  read_many lays every request's chunks end to end, posts them through ONE window
+    /// and drains once: the in-flight bytes are then a layer's whole miss set (24 MB at eight experts)
+    /// instead of one part's.  All or nothing, same as read(): a failed completion or a deadline
+    /// leaves the destinations undefined and the caller re-reads those rows another way.
+    bool read_many(const std::vector<ReadReq>& reqs, int timeout_ms, std::string& err);
 
     /// Rows read and bytes pulled, cumulative over this Reader (the tiers line's peer counters).
     uint64_t rows() const { return rows_; }

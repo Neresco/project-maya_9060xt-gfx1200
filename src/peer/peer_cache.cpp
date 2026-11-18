@@ -1,6 +1,7 @@
 #include "peer_cache.hpp"
 
 #include "peer_budget.hpp"
+#include "peer_vram.hpp"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -9,8 +10,37 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 
 namespace strata::peer {
+
+namespace {
+
+/// Pinned system RAM: the Mr over a page-aligned malloc.  Rows are pread'd straight into it, so
+/// put() is never reached (host() is the window itself).
+class RamSlab final : public Slab {
+public:
+    bool open(ibv_pd* pd, size_t bytes, std::string& err) {
+        if (!mr_.alloc(pd, bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ, err)) return false;
+        buf_ = mr_.buf();
+        bytes_ = mr_.bytes();
+        rkey_ = mr_.rkey();
+        return true;
+    }
+    void* host() override { return buf_; }
+    bool put(size_t, const void*, size_t, std::string&) override { return false; }   // (host() covers it)
+    uint64_t addr_at(size_t off) const override { return (uint64_t) (uintptr_t) ((char*) buf_ + off); }
+    size_t bytes() const override { return bytes_; }
+    uint32_t rkey() const override { return rkey_; }
+
+private:
+    Mr mr_;
+    void* buf_ = nullptr;
+    size_t bytes_ = 0;
+    uint32_t rkey_ = 0;
+};
+
+}   // namespace
 
 void (*PeerCache::alloc_log_)(uint64_t bytes) = nullptr;
 
@@ -33,8 +63,37 @@ void PeerCache::close() {
     arenas_.clear();
     where_.clear();
     dropped_.clear();
+    stage_.clear();
+    std::vector<char>().swap(stage_);
     cached_bytes_ = 0;
+    ram_bytes_ = 0;
     next_arena_ = 0;
+}
+
+bool PeerCache::add_vram(int gpu, uint64_t bytes, std::string& err) {
+    if (dev_ == nullptr) {
+        err = "a VRAM slab needs the daemon's device open first";
+        return false;
+    }
+    say("allocating a " + std::to_string(bytes >> 20) + " MiB VRAM slab on GPU " +
+        std::to_string(gpu) + " (exporting a dmabuf, be patient)");
+    std::unique_ptr<Slab> slab = make_vram_slab(gpu, (size_t) bytes, dev_->pd(), err);
+    if (slab == nullptr) return false;
+    ArenaRec rec;
+    rec.slab = std::move(slab);
+    rec.pool = (int) next_pool_++;
+    auto* out = &arenas_[next_arena_++];
+    *out = std::move(rec);
+    vram_total_ += bytes;   // (the slab's spec, not what it has taken: capacity is a start-up number)
+    return true;
+}
+
+std::pair<uint32_t, PeerCache::ArenaRec*> PeerCache::pick_vram(size_t bytes) {
+    for (auto& kv : arenas_) {
+        if (kv.second.pool == 0) continue;
+        if (kv.second.used + bytes <= kv.second.slab->bytes()) return {kv.first, &kv.second};
+    }
+    return {0, nullptr};
 }
 
 bool PeerCache::open_shards(const std::vector<std::string>& names, const std::vector<uint64_t>& sizes,
@@ -126,22 +185,26 @@ std::string pack_fingerprint(const std::string& dir, const std::vector<std::stri
 void PeerCache::drop_arena(uint32_t id) {
     const auto arena = arenas_.find(id);
     if (arena == arenas_.end()) return;
+    const bool ram = arena->second.pool == 0;
     for (auto it = where_.begin(); it != where_.end();) {
         if (it->second.arena == id) {
             dropped_.push_back(it->first);
             cached_bytes_ -= it->second.len;
+            if (ram) ram_bytes_ -= it->second.len;
             it = where_.erase(it);
         } else {
             ++it;
         }
     }
-    cached_bytes_ -= arena->second.used;
+    // (cached_bytes_ is the sum of the rows' lens, which is what an arena's used counter is too: subtracting it as
+    // well underflowed the budget - one eviction made every later fill evict the whole slab and then refuse)
     arenas_.erase(arena);
 }
 
 PeerCache::ArenaRec* PeerCache::room_for(size_t bytes, uint64_t stamp, uint32_t* id_out, std::string& err) {
     for (auto& kv : arenas_) {
-        if (kv.second.used + bytes <= kv.second.mr->bytes()) {
+        if (kv.second.pool != 0) continue;      // (a VRAM slab is chosen by pick_vram, never by the RAM pool)
+        if (kv.second.used + bytes <= kv.second.slab->bytes()) {
             kv.second.stamp = stamp;
             *id_out = kv.first;
             return &kv.second;
@@ -149,34 +212,65 @@ PeerCache::ArenaRec* PeerCache::room_for(size_t bytes, uint64_t stamp, uint32_t*
     }
     // nothing fits: a fresh arena under the budget, else LRU arenas out whole until it does
     const size_t cap = std::max<size_t>(bytes, arena_bytes_);
-    while (cached_bytes_ + cap > budget_ && !arenas_.empty()) {
+    while (ram_bytes_ + cap > budget_ && !arenas_.empty()) {
         uint32_t oldest = 0;
         uint64_t best = UINT64_MAX;
         for (const auto& kv : arenas_) {
+            if (kv.second.pool != 0) continue;  // (VRAM rows do not compete with the RAM budget)
             if (kv.second.stamp < best) {
                 best = kv.second.stamp;
                 oldest = kv.first;
             }
         }
+        if (best == UINT64_MAX) break;          // (only VRAM slabs are left: nothing to evict here)
         drop_arena(oldest);
     }
-    if (cached_bytes_ + cap > budget_) {
+    if (ram_bytes_ + cap > budget_) {
         err = "the slab's budget (" + std::to_string(budget_ >> 20) + " MiB) is exhausted and its " +
               "rows are all in use; raise the daemon's --ram-gb";
         return nullptr;
     }
     ArenaRec rec;
-    rec.mr = std::make_unique<Mr>();
+    auto ram = std::make_unique<RamSlab>();
     log_alloc(cap);                      // GiBs of pinning mid-request: the caller may stall here
-    if (!rec.mr->alloc(dev_->pd(), cap, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ, err)) {
-        return nullptr;
-    }
+    if (!ram->open(dev_->pd(), cap, err)) return nullptr;
+    rec.slab = std::move(ram);
     rec.stamp = stamp;
     const uint32_t id = next_arena_++;
     auto* out = &arenas_[id];
     *out = std::move(rec);
     *id_out = id;
     return out;
+}
+
+bool PeerCache::host_row(long long ri, const void*& p, uint32_t& len) const {
+    p = nullptr;
+    len = 0;
+    const auto it = where_.find(ri);
+    if (it == where_.end()) return false;
+    const auto arena = arenas_.find(it->second.arena);
+    if (arena == arenas_.end() || arena->second.slab->host() == nullptr) return false;
+    // the row's window is the arena's host base plus its bump offset (the offset is the difference between
+    // the row's address and the arena's own address at 0 - never the address itself, which is 0 for the first row)
+    p = (const char*) arena->second.slab->host() + (it->second.addr - arena->second.slab->addr_at(0));
+    len = it->second.len;
+    return true;
+}
+
+bool PeerCache::dev_row(long long ri, uint64_t& addr, uint32_t& len, int& gpu) const {
+    addr = 0;
+    len = 0;
+    gpu = -1;
+    const auto it = where_.find(ri);
+    if (it == where_.end()) return false;
+    const auto arena = arenas_.find(it->second.arena);
+    if (arena == arenas_.end()) return false;
+    // (the slab's own ordinal, not the row's: a row's address in a device slab is that card's alone)
+    gpu = arena->second.slab->gpu();
+    if (gpu < 0) return false;             // (host memory: host_row's business)
+    addr = it->second.addr;
+    len = it->second.len;
+    return true;
 }
 
 bool PeerCache::fill(const std::vector<long long>& rows, const std::vector<Row>& table, uint64_t stamp,
@@ -190,29 +284,63 @@ bool PeerCache::fill(const std::vector<long long>& rows, const std::vector<Row>&
             return false;
         }
         const Row& r = table[(size_t) ri];
+        // (a row with no bytes - a dense layer, or a shard this daemon does not hold - is never asked: room_for(0)
+        // would hand out a whole arena.  A shard index past the manifest's is a bug on the initiator's side; the
+        // pread below would read through an fd that is not a shard at all)
+        if (r.len == 0) {
+            err = "row " + std::to_string(ri) + " has no bytes to fill";
+            return false;
+        }
+        if ((size_t) r.shard >= shard_fd_.size()) {
+            err = "row " + std::to_string(ri) + " names shard " + std::to_string(r.shard) + ", the manifest " +
+                  "carried " + std::to_string(shard_fd_.size());
+            return false;
+        }
+        if (r.off > shard_size_[(size_t) r.shard] || r.len > shard_size_[(size_t) r.shard] - r.off) {
+            err = "row " + std::to_string(ri) + "'s [" + std::to_string(r.off) + ", +" + std::to_string(r.len) +
+                  ") runs past the end of shard " + std::to_string(r.shard) + " (" +
+                  std::to_string(shard_size_[(size_t) r.shard]) + " bytes)";
+            return false;
+        }
         const auto have = where_.find(ri);
         if (have != where_.end()) {
             arenas_[have->second.arena].stamp = stamp;
             out.push_back(have->second);
             continue;
         }
-        uint32_t arena_id = 0;
-        ArenaRec* a = room_for(r.len, stamp, &arena_id, err);
-        if (a == nullptr) return false;
-        const ssize_t got = pread(shard_fd_[r.shard], (char*) a->mr->buf() + a->used, r.len,
-                                  (off_t) r.off);
+        // VRAM first (the explicit, scarce tier, in --vram order), the RAM slab after it: a row the
+        // VRAM slab cannot hold spills instead of failing, and the row map does not care which it got
+        std::pair<uint32_t, ArenaRec*> land = pick_vram((size_t) r.len);
+        if (land.second == nullptr) {
+            uint32_t id = 0;
+            ArenaRec* ram = room_for((size_t) r.len, stamp, &id, err);
+            if (ram == nullptr) return false;
+            land = std::make_pair(id, ram);
+        }
+        ArenaRec& a = *land.second;
+        Slab* slab = a.slab.get();
+        void* dst = slab->host();
+        if (dst != nullptr) dst = (char*) dst + a.used;
+        else {
+            if (stage_.size() < (size_t) r.len) stage_.resize((size_t) r.len);
+            dst = stage_.data();
+        }
+        const ssize_t got = pread(shard_fd_[r.shard], dst, r.len, (off_t) r.off);
         if (got < 0 || (size_t) got != r.len) {
             err = "shard " + std::to_string(r.shard) + " pread at " + std::to_string(r.off) +
                   " failed (" + std::strerror(errno) + ")";
             return false;
         }
+        if (slab->host() == nullptr && !slab->put(a.used, stage_.data(), r.len, err)) return false;
         Cached c;                     // (the map's arena id: the daemon's own accounting only)
-        c.addr = (uint64_t) (uintptr_t) ((char*) a->mr->buf() + a->used);
+        c.addr = slab->addr_at(a.used);
         c.len = r.len;
-        c.rkey = a->mr->rkey();
-        c.arena = arena_id;
-        a->used += r.len;
+        c.rkey = slab->rkey();
+        c.arena = land.first;
+        a.used += r.len;
+        a.stamp = stamp;
         cached_bytes_ += r.len;
+        if (a.pool == 0) ram_bytes_ += r.len;
         where_[ri] = c;
         out.push_back(c);
     }

@@ -24,6 +24,9 @@
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/exl3_ref.hpp"
 #include "strata/platform/env_switch.hpp"
+#if defined(STRATA_HAVE_PEER)
+#include "glm_peer_tier.hpp"   // Phase 3's peer tier (--peer): an opt-in, engine-invisible-when-off tier
+#endif
 #include "strata/platform/idle_gate.hpp"
 
 #include "ggml.h"
@@ -2056,6 +2059,10 @@ bool Glm5Model::fast_setup(std::string& err) {
         }
         for (int il = l0_; il < lt_; ++il)
             if (F->L[(size_t) il].moe) F->all_bytes += (size_t) g.n_expert * (size_t) F->lp[(size_t) il].stride;
+        // PHASE 3: the peer tier, now that the RAM tier and the staging buffers it offers to the NIC exist.
+        // Off unless --peer / STRATA_GLM_PEER names a daemon; a refusal prints and leaves the disk path alone
+        // (the session is process-wide, so a split's later parts attach to the one the first opened).
+        if (!fast_peer_open(err)) return false;
         F->upd_at.assign((size_t) (2 * F->n_keys + NL * gf::kSpares), 0);
         F->upd_gen.assign(F->upd_at.size(), 0u);
         // disk reads: three slices per expert in parallel, through the staging above when the RAM tier has no free slot
@@ -4346,6 +4353,9 @@ void Glm5Model::fast_destroy() {
                      (unsigned long long) F->demotions.load(), (unsigned long long) F->drops.load(),
                      (unsigned long long) F->prefetches.load(), (unsigned long long) F->miss_layers.load(),
                      (double) F->miss_us.load() / 1000.0);
+#if defined(STRATA_HAVE_PEER)
+    if (F->peer != nullptr) F->peer->report();   // (once a process: a split's parts share the session)
+#endif
     if (F->timing && F->pred_n.load() > 0)
         std::fprintf(stderr, "glm fast predict CUDA%d: %.2f of 8 experts predicted one layer early; %.1f%% of the "
                              "non-resident ones (%llu)\n",
@@ -4999,6 +5009,25 @@ void Glm5Model::fast_service() {
                         dst[m] = F->stage[(size_t) m];
                     }
                 }
+                // ---- THE PEER TIER: a miss the peer's slab holds is pulled over RoCE into the very place the
+                //      disk read would have written (the RAM slot this route reserved, or the staging buffer), so
+                //      nothing downstream changes.  An expert it cannot serve - a row it never filled, a
+                //      destination the NIC would not register, a session that just died - keeps its disk read
+                //      below, byte for byte, which is why this can only ever change the speed.
+                if (F->peer != nullptr && nr > 0) {
+                    int served[8];
+                    const auto tp = std::chrono::steady_clock::now();
+                    const int n_peer = fast_peer_serve(il, ids, mi, rd, nr, dst, served);
+                    if (n_peer > 0) {
+                        int kept = 0;   // the others keep their disk read (order is kept: rd[] stays ascending)
+                        for (int r2 = 0; r2 < nr; ++r2)
+                            if (served[r2] == 0) rd[kept++] = rd[r2];
+                        nr = kept;
+                    }
+                    F->peer_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                                             std::chrono::steady_clock::now() - tp).count(),
+                                         std::memory_order_relaxed);
+                }
                 // each part in chunks across the workers: the O_DIRECT bounce copy of a whole part was ~0.4 ms of the
                 // wait (Mercury: 3.6 -> 3.1 ms a disk wait at 8 chunks; STRATA_GLM_READ_CHUNKS overrides - a Windows
                 // laptop on an Intel RST RAID read 15% faster with 4, #67 - and setup's calibration tries 4 and 2)
@@ -5313,6 +5342,195 @@ void Glm5Model::fast_read_part(int il, int e, int role, uint8_t* blob, int chunk
     const size_t c0 = std::min(len, (size_t) chunk * piece), c1 = std::min(len, c0 + piece);
     if (c1 > c0)
         read_slice(sh, off + c0, c1 - c0, blob + (role == 0 ? 0 : role == 1 ? Ly.gu_bytes : 2 * Ly.gu_bytes) + c0);
+}
+
+// ================================ PHASE 3: THE PEER EXPERT TIER ================================
+//
+// **THE SAME BYTES, FROM THE OTHER MACHINE'S RAM.**  A miss that is in neither VRAM nor this machine's
+// RAM tier is read off the local disk by `fast_read_part` - three slices of the pack per expert.  When
+// `--peer` names a machine running `strata-peer` over the pack, the peer holds those shards in a
+// pinned slab and its NIC answers RDMA READs, so the layer's misses are pulled over RoCE into the same
+// places the disk read would have written them: the RAM slot this route already reserved, or the
+// staging buffer when the tier is full.  Nothing downstream can tell the difference - the device's
+// fetch reads the same pointers - and the tier refuses anything it cannot do (an unadvertised row, a
+// destination the NIC would not register, a dead session) so the disk read runs, byte for byte.
+//
+// WHY IT IS WORTH DOING: a two-machine split turns one machine's 34-90 GB of expert traffic a token
+// into a link's, at ~2.5-3 GB/s for a ConnectX-4 Lx pair at MTU 9000 - an NVMe's speed on a good day
+// and better than one on a bad one, with the peer's RAM tier (108 GB in an LXC) standing in for a
+// local one that is not big enough.
+//
+// IT IS OFF BY DEFAULT AND INVISIBLE WHEN OFF: no session, no MRs, no thread, and the miss path is
+// what it was.  v1 does the DECODE path only (the prompt path's landing ring is the next step), one
+// peer, no GPUDirect, and no write-back - the last two are what would make it slower before it made it
+// faster.
+#if defined(STRATA_HAVE_PEER)
+namespace {
+
+/// A peer setting, under its STRATA name and the MAYA name the docs use (the engine reads STRATA_*,
+/// the user-facing flags set the same variable under both - see generate.cpp).
+const char* peer_env(const char* strata_name, const char* maya_name) {
+    const char* v = getenv(strata_name);
+    return v != nullptr ? v : getenv(maya_name);
+}
+
+/// dirname of a shard path, "" -> "." (a relative pack name is a pack in the working directory).
+std::string peer_dir_of(const std::string& path) {
+    const size_t slash = path.find_last_of("/\\");
+    return slash == std::string::npos ? std::string(".") : (slash == 0 ? std::string("/") : path.substr(0, slash));
+}
+
+}  // namespace
+#endif
+
+bool Glm5Model::fast_peer_open(std::string& err) {
+    (void) err;
+    FastState* F = fast_;
+#if !defined(STRATA_HAVE_PEER)
+    return true;   // built without ibverbs: the tier does not exist and nothing changes
+#else
+    if (F == nullptr) return true;
+    const char* host = peer_env("STRATA_GLM_PEER", "MAYA_GLM_PEER");
+    if (host == nullptr || host[0] == '\0' || std::strcmp(host, "off") == 0) return true;   // the default
+    glmfast::PeerTier::Config cfg;
+    cfg.host = host;
+    const char* pv = peer_env("STRATA_GLM_PEER_PORT", "MAYA_GLM_PEER_PORT");
+    cfg.port = pv != nullptr ? std::atoi(pv) : 9447;
+    const char* dv = peer_env("STRATA_GLM_PEER_DEVICE", "MAYA_GLM_PEER_DEVICE");
+    cfg.device = dv != nullptr ? dv : "";
+    if (const char* v = peer_env("STRATA_GLM_PEER_WINDOW", "MAYA_GLM_PEER_WINDOW")) cfg.window = std::atoi(v);
+    if (const char* v = peer_env("STRATA_GLM_PEER_CHUNK_MB", "MAYA_GLM_PEER_CHUNK_MB")) cfg.chunk_mb = std::atoi(v);
+    if (const char* v = peer_env("STRATA_GLM_PEER_TIMEOUT_MS", "MAYA_GLM_PEER_TIMEOUT_MS")) cfg.timeout_ms = std::atoi(v);
+    cfg.window = std::max(1, std::min(64, cfg.window));
+    cfg.chunk_mb = std::max(1, std::min(16, cfg.chunk_mb));
+    // THE PACK: the shards' own directory on THIS machine.  The daemon resolves the manifest's basenames
+    // inside its own --pack dir, and the two copies are bound by a fingerprint (size + FNV-1a of the first
+    // and last MiB of each shard) - so this copy is never read by the tier, it only has to BE the pack.
+    if (pack_shards_.empty()) {
+        std::fprintf(stderr, "glm peer: no pack shards are loaded - the tier needs the pack's own copy to "
+                             "fingerprint; the disk path runs unchanged\n");
+        return true;
+    }
+    cfg.pack_dir = peer_dir_of(pack_shards_[0].path);
+    for (const auto& sh : pack_shards_) {
+        if (peer_dir_of(sh.path) != cfg.pack_dir) {
+            std::fprintf(stderr, "glm peer: the pack's shards are in different directories (%s and %s) - the tier "
+                                 "needs one; the disk path runs unchanged\n", cfg.pack_dir.c_str(), sh.path.c_str());
+            return true;
+        }
+        const size_t slash = sh.path.find_last_of("/\\");
+        cfg.shard_names.push_back(slash == std::string::npos ? sh.path : sh.path.substr(slash + 1));
+        cfg.shard_sizes.push_back(sh.size);
+    }
+    // THE ROW TABLE, from the pack's expert layout: expert e's gate is [gate_off + e * gu, + gu) of its
+    // shard, its up likewise and its down [down_off + e * dn, + dn).  Same arithmetic as fast_read_part,
+    // one row per (layer, expert, part), so a row is exactly one read the disk path would have done.
+    const Glm5Geometry& g = g_;
+    cfg.n_layers = g.n_layers;
+    cfg.n_expert = g.n_expert;
+    cfg.specs.assign((size_t) (g.n_layers * glmfast::PeerTier::kRoles), glmfast::PeerRowSpec{});
+    int served_layers = 0;
+    for (int il = 0; il < g.n_layers; ++il) {
+        const auto& nl = pack_layers_[(size_t) il];
+        if (nl.layer < 0) continue;                     // a dense layer: it routes nothing
+        if (nl.x_cb >= 0) {
+            // EXL3: a part is three pieces (trellis, suh, svh) in up to three shards, so one row a part
+            // is not one contiguous range - a row per piece is the next step, refused rather than wrong
+            std::fprintf(stderr, "glm peer: the pack's experts are EXL3 (trellis-coded), which the tier does not "
+                                 "serve yet - the disk path runs unchanged\n");
+            return true;
+        }
+        const uint64_t gu = (uint64_t) nl.fmt.gu_row * (uint64_t) g.n_ff_exp;
+        const uint64_t dn = (uint64_t) nl.fmt.d_row * (uint64_t) g.n_embd;
+        if (gu == 0 || dn == 0) continue;
+        auto& spec = cfg.specs;
+        const size_t at = (size_t) (il * glmfast::PeerTier::kRoles);
+        spec[at + 0] = glmfast::PeerRowSpec{nl.gate_shard, nl.gate_off, gu, (uint32_t) gu};
+        spec[at + 1] = glmfast::PeerRowSpec{nl.up_shard, nl.up_off, gu, (uint32_t) gu};
+        spec[at + 2] = glmfast::PeerRowSpec{nl.down_shard, nl.down_off, dn, (uint32_t) dn};
+        ++served_layers;
+    }
+    if (served_layers == 0) {
+        std::fprintf(stderr, "glm peer: this pack names no expert layers the tier can serve - the disk path runs "
+                             "unchanged\n");
+        return true;
+    }
+    std::string why;
+    glmfast::PeerTier* tier = glmfast::PeerTier::open_session(cfg, why);
+    if (tier == nullptr) {
+        std::fprintf(stderr, "glm peer: no session with %s:%d (%s) - the disk path runs unchanged\n", cfg.host.c_str(),
+                     cfg.port, why.c_str());
+        return true;
+    }
+    F->peer = tier;
+    // THE DESTINATIONS the NIC may write into: every piece of this part's RAM tier (where a miss lands)
+    // and its staging buffers (where a miss goes when the tier has no free slot - the same pointers the
+    // disk read uses).  A piece the NIC refuses keeps the disk path for its experts; nothing else changes.
+    uint64_t dst_mb = 0;
+    int refused = 0;
+    const auto offer = [&](void* base, size_t bytes) {
+        if (base == nullptr || bytes == 0) return;
+        if (tier->register_dst(base, bytes)) dst_mb += bytes >> 20;
+        else ++refused;
+    };
+    for (const auto& R : F->rc) {
+        if (R.n <= 0) continue;
+        if (R.per_part > 0) {
+            for (size_t i = 0; i < R.parts.size(); ++i) offer(R.parts[i], R.part_slots(i) * R.stride);
+        } else {
+            offer(R.base, (size_t) R.n * R.stride);
+        }
+    }
+    for (uint8_t* sbuf : F->stage) offer(sbuf, F->stage_bytes);
+    std::fprintf(stderr,
+                 "glm peer: CUDA%d reads its misses over RoCE from %s:%d (%.2f GB of %d layers offered to the NIC, "
+                 "%d piece(s) refused)%s\n",
+                 dev_, cfg.host.c_str(), cfg.port, (double) dst_mb / 1024.0, served_layers, refused,
+                 refused > 0 ? " - those experts stay on the disk path" : "");
+    return true;
+#endif
+}
+
+int Glm5Model::fast_peer_serve(int il, const int* ids, const int* mi, const int* rd, int nr, uint8_t* const* dst,
+                               int* served_rd) {
+    (void) il, (void) ids, (void) mi, (void) rd, (void) nr, (void) dst, (void) served_rd;
+#if !defined(STRATA_HAVE_PEER)
+    return 0;
+#else
+    FastState* F = fast_;
+    if (F == nullptr || F->peer == nullptr || nr <= 0) return 0;
+    // THREE ROWS AN EXPERT, in the blob's [gate | up | down] order - the same three slices the disk read
+    // asks for, so a served expert and a disk-read one land identical bytes in the identical place.
+    const auto& Ly = F->L[(size_t) il];
+    constexpr int kMaxRows = 24;
+    long long rows[kMaxRows];
+    uint8_t* pdst[kMaxRows];
+    char ok[kMaxRows];
+    int at[8], pn = 0;
+    for (int r2 = 0; r2 < nr && r2 < 8; ++r2) {
+        at[r2] = -1;
+        const long long row0 = F->peer->row_of(il, ids[mi[rd[r2]]]);
+        if (row0 < 0 || pn + 3 > kMaxRows) continue;   // (a layer the tier does not serve: its disk read)
+        at[r2] = pn;
+        rows[pn] = row0 + 0;
+        pdst[pn++] = dst[rd[r2]];
+        rows[pn] = row0 + 1;
+        pdst[pn++] = dst[rd[r2]] + Ly.gu_bytes;
+        rows[pn] = row0 + 2;
+        pdst[pn++] = dst[rd[r2]] + 2 * Ly.gu_bytes;
+    }
+    if (pn == 0) return 0;
+    F->peer->serve(pn, rows, pdst, ok);
+    int served = 0;
+    for (int r2 = 0; r2 < nr && r2 < 8; ++r2) {
+        // ALL THREE OR THE DISK: a part pulled and a part missing is not a blob, and the disk read copies
+        // all three into the same place anyway (a partial one would be silently half the old contents)
+        const bool all = at[r2] >= 0 && ok[at[r2]] && ok[at[r2] + 1] && ok[at[r2] + 2];
+        served_rd[r2] = all ? 1 : 0;
+        served += all ? 1 : 0;
+    }
+    return served;
+#endif
 }
 
 // ---- LOOKAHEAD, for the route of layer il (service thread, F->mu held): score the predictions made for this layer

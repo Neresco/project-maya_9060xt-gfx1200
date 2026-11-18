@@ -81,6 +81,14 @@ public:
     bool send(const std::string& json_line, std::string& err);
     /// One JSON line in, or "" past `timeout_ms` (then err says so; a closed peer sets closed_).
     std::string recv(int timeout_ms, std::string& err);
+    /// **A RAW BODY BESIDE A LINE** (the compute exchange's activation and sums): `bytes` bytes out
+    /// after the header line send flushed, no framing of its own - both ends derive every length from the
+    /// geometry, so a body needs neither lengths nor padding.  False (err, closed_) exactly as write_all's.
+    bool send_body(const void* p, size_t bytes, std::string& err);
+    /// `bytes` bytes in, the header line's over-read first: getline reads a socket's whole buffer, so the
+    /// body's first bytes are usually already here.  Bounded by the same budget the lines use (connect's
+    /// timeout_ms; the daemon's adopted socket waits as long as its read loop does).
+    bool recv_body(void* p, size_t bytes, std::string& err);
     bool closed() const { return closed_; }
 
 private:
@@ -88,6 +96,7 @@ private:
 
     int fd_ = -1;
     bool closed_ = false;
+    int body_timeout_ms_ = -1;        // recv_body's budget (-1: no deadline, the daemon's)
     std::string line_;              // recv's over-read: bytes past the last full line, kept here
 };
 

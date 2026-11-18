@@ -256,6 +256,12 @@ slowest while the caches fill with what you use.
   does: [serve/mcp.py](serve/mcp.py).
 - **Docker:** there is no official image. [docs/DOCKER.md](docs/DOCKER.md) is a recipe to build one from a release.
 - **From another device:** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
+- **Two machines:** a pack neither machine could hold alone can be split across two. `strata-peer` beside the second
+  machine's disks serves the shards it holds and the engine pulls its experts over RDMA (RoCE or InfiniBand - 24.5
+  Gb/s, about 3 GB/s, read on our link; not TCP); a slice the peer does not hold or a peer that went away is read from
+  this machine's disk, as before: [docs/RDMA_PEER_TIER.md](docs/RDMA_PEER_TIER.md). The peer's own cards and cores
+  were measured as a compute tier too - a peer pick at 50 µs against 478 µs on this machine's CPU lane - but that tier
+  is not built yet: [docs/PEER_COMPUTE.md](docs/PEER_COMPUTE.md).
 - **Tuning:** `./maya.sh --calibrate` tunes the engine to your hardware in 10-15 minutes. Every setting:
   [docs/SETTINGS.md](docs/SETTINGS.md).
 - <a name="deepseek-engram-prompt-read-ahead"></a><a name="deepseek-conversations-kept"></a><a name="deepseek-loading-the-experts"></a>**Each model's own options** - GLM-5.3-Flash's several requests at once (`--parallel`), long contexts and DFlash2

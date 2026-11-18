@@ -367,10 +367,11 @@ if(NOT WIN32 AND EXISTS "/usr/include/infiniband/verbs.h")
   find_package(Threads)
   add_library(strata_peer STATIC src/peer/peer_rdma.cpp src/peer/peer_ctl.cpp src/peer/peer_read.cpp
                                  src/peer/peer_budget.cpp src/peer/peer_cache.cpp
-                                 src/peer/peer_client.cpp)
+                                 src/peer/peer_vram.cpp src/peer/peer_client.cpp
+                                 src/peer/peer_compute.cpp)
   target_include_directories(strata_peer PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/peer)
   target_link_libraries(strata_peer PUBLIC strata_warnings)
-  target_link_libraries(strata_peer PUBLIC ibverbs rdmacm)
+  target_link_libraries(strata_peer PUBLIC ibverbs rdmacm ${CMAKE_DL_LIBS})
   if(Threads_FOUND)
     target_link_libraries(strata_peer PUBLIC Threads::Threads)
   endif()
@@ -384,6 +385,15 @@ if(NOT WIN32 AND EXISTS "/usr/include/infiniband/verbs.h")
                                STRATA_PEER_BIN="$<TARGET_FILE:strata-peer>")
     add_test(NAME peer_rdma_test COMMAND peer_rdma_test)
     set_tests_properties(peer_rdma_test PROPERTIES TIMEOUT 180)
+    # the DeepSeek engine's end of it (--peer): the row table, sub-ranges, DS4_FLOW_DOWN_PART's compaction and the
+    # fallback that hands every order the wire does not deliver to the flow's own IoQueue - no GPU, no pack
+    add_executable(ds4_peer_tier_test tests/ds4_peer_tier_test.cpp src/ds4/ds4_peer_tier.cpp)
+    target_include_directories(ds4_peer_tier_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/ds4)
+    target_link_libraries(ds4_peer_tier_test PRIVATE strata_peer)
+    target_compile_definitions(ds4_peer_tier_test PRIVATE STRATA_HAVE_PEER=1
+                               STRATA_PEER_BIN="$<TARGET_FILE:strata-peer>")
+    add_test(NAME ds4_peer_tier_test COMMAND ds4_peer_tier_test)
+    set_tests_properties(ds4_peer_tier_test PROPERTIES TIMEOUT 180)
   endif()
 endif()
 
@@ -632,6 +642,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu src/core/glm_mtp_rows.cu)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  # Phase 3's peer expert tier (--peer): the engine's end of strata-peer.  Only when strata_peer exists (ibverbs
+  # installed, not Windows) - the tier is opt-in, and without it the engine compiles to the disk path alone.
+  if(TARGET strata_peer)
+    target_sources(strata_engine PRIVATE src/core/glm_peer_tier.cpp)
+    target_link_libraries(strata_engine PUBLIC strata_peer)
+    target_compile_definitions(strata_engine PUBLIC STRATA_HAVE_PEER=1)
+  endif()
   if(WIN32 AND STRATA_ENABLE_CUDA)
     target_link_libraries(strata_engine PRIVATE dxgi)
   endif()
@@ -745,6 +762,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)   # (the prompt path's dense GEMMs: ds4_lt.cu)
       set_source_files_properties(src/ds4/ds4_lt.cu PROPERTIES COMPILE_DEFINITIONS STRATA_HIPBLASLT_AVAILABLE=1)
       target_link_libraries(maya-ds4 PRIVATE roc::hipblaslt)
+    endif()
+    # Phase 3's peer expert tier (--peer): the engine's end of strata-peer (ds4_peer_tier.hpp).  Built when
+    # strata_peer exists - without ibverbs the file's stubs say the tier is off, and the engine runs as before
+    target_sources(maya-ds4 PRIVATE src/ds4/ds4_peer_tier.cpp)
+    if(TARGET strata_peer)
+      target_link_libraries(maya-ds4 PRIVATE strata_peer)
+      target_compile_definitions(maya-ds4 PRIVATE STRATA_HAVE_PEER=1)
     endif()
     if(DS4_CUDA_PEER_AR AND NOT STRATA_ENABLE_HIP)
       target_sources(maya-ds4 PRIVATE src/ds4/ds4_peer_calibrate.cu)
@@ -1504,6 +1528,77 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
+
+  # ---- strata_peer_compute_cpu (docs/PEER_COMPUTE.md, stage 1) ------------------------------------
+  # The peer's compute worker: one shared object the daemon loads by path (strata-peer --compute) and hands
+  # compute orders to, so the peer computes the experts it holds instead of only serving their bytes.  It computes
+  # a routed expert with the engine's CPU lane arithmetic (src/ds4/ds4_iq_cpu.cpp, so ggml-cpu) - which is why it
+  # cannot sit beside strata_peer above: ggml is defined here, after it.  PIC on the static pieces it links is what a
+  # shared object needs (a HIP build sets it globally, a CPU-only one does not).
+  if(NOT WIN32 AND TARGET strata_peer AND TARGET strata_kernels_cpu)
+    set_target_properties(strata_kernels_cpu ggml-cpu ggml-base PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    add_library(strata_peer_compute_cpu MODULE src/peer/peer_compute_cpu.cpp src/ds4/ds4_iq_cpu.cpp)
+    target_include_directories(strata_peer_compute_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/peer
+                              ${CMAKE_CURRENT_SOURCE_DIR}/src/ds4 ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
+    target_link_libraries(strata_peer_compute_cpu PRIVATE strata_kernels_cpu strata_warnings)
+    set_target_properties(strata_peer_compute_cpu PROPERTIES PREFIX "" OUTPUT_NAME "strata-peer-compute-cpu")
+    if(STRATA_BUILD_TESTS)
+      # the daemon's --compute end to end: the real strata-peer with the worker loaded, two synthetic IQ2_XXS
+      # experts, a batch of compute orders against the local lane, a row the daemon does not hold, a daemon with
+      # no worker at all, and a daemon killed under a batch (THE PEER IS DOWN) - no GPU, no pack
+      add_executable(peer_compute_test tests/peer_compute_test.cpp src/ds4/ds4_peer_tier.cpp src/ds4/ds4_iq_cpu.cpp)
+      target_include_directories(peer_compute_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/ds4
+                                ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
+      target_link_libraries(peer_compute_test PRIVATE strata_peer strata_kernels_cpu)
+      target_compile_definitions(peer_compute_test PRIVATE STRATA_HAVE_PEER=1
+                                 STRATA_PEER_BIN="$<TARGET_FILE:strata-peer>"
+                                 STRATA_PEER_COMPUTE_SO="$<TARGET_FILE:strata_peer_compute_cpu>")
+      add_test(NAME peer_compute_test COMMAND peer_compute_test)
+      set_tests_properties(peer_compute_test PROPERTIES TIMEOUT 180)
+    endif()
+  endif()
+  # ---- strata_peer_compute_hip (docs/PEER_COMPUTE.md, stage 2) --------------------------------------
+  # The peer's card as a compute worker: the same ABI, the engine's own expert kernels (src/ds4/ds4_iq.cu) - which
+  # is why it is a module of its own beside the CPU worker, built only where the HIP runtime is.  The worker's
+  # targets are the peer machine's cards (gfx1102: the RX 7600 XT, gfx1151: the Strix Halo APU), NOT this tree's
+  # CMAKE_HIP_ARCHITECTURES: the per-target HIP_ARCHITECTURES property (CMake 3.21 and newer gangs the list to
+  # this target alone) overrides the global one for exactly this object.  A HIP build that cannot override it (CMake
+  # older than 3.21) has no way to carry the worker's two architectures in a gfx1200 build: configure the tree with
+  # -DCMAKE_HIP_ARCHITECTURES="gfx1200;gfx1102;gfx1151" instead.
+  if(STRATA_ENABLE_HIP AND TARGET strata_hip_runtime AND TARGET strata_peer)
+    add_library(strata_peer_compute_hip MODULE src/peer/peer_compute_hip.cu src/ds4/ds4_iq.cu)
+    target_include_directories(strata_peer_compute_hip PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/peer
+                              ${CMAKE_CURRENT_SOURCE_DIR}/src/ds4 ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml
+                              ${_strata_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(strata_peer_compute_hip PRIVATE strata_hip_runtime strata_warnings)
+    # (ds4_iq.cu without the rest of maya-ds4: maya-mm3's precedent, its dependent launch and its AMD prompt
+    #  experts' MMQ left out - and STRATA_DS4_IQ_STRICT_FP, so a peer gfx11 card rounds its sums as this tree's
+    #  gfx1200 does rather than as gfx11's default does (the ~7% of gfx11 decode it costs is paid in the worker alone)
+    target_compile_definitions(strata_peer_compute_hip PRIVATE MAYA_DS4_IQ_ONLY STRATA_DS4_IQ_STRICT_FP=1)
+    # (one list for both: the property the compiler is given, and the define the worker checks its card against -
+    #  so a card the worker has no code for is refused at open, not launched on and aborted by ROCm 7's own assertion)
+    set(_peer_compute_hip_archs "gfx1102;gfx1151")
+    string(REPLACE ";" "," _peer_compute_hip_archs_csv "${_peer_compute_hip_archs}")
+    set_target_properties(strata_peer_compute_hip PROPERTIES PREFIX "" OUTPUT_NAME "strata-peer-compute-hip"
+                              HIP_ARCHITECTURES "${_peer_compute_hip_archs}")
+    target_compile_definitions(strata_peer_compute_hip PRIVATE STRATA_PEER_HIP_ARCHS="${_peer_compute_hip_archs_csv}")
+    if(STRATA_BUILD_TESTS)
+      # the peer's card end to end: the real strata-peer with the HIP worker loaded and a --vram slab, two
+      # synthetic IQ2_XXS experts, a batch of orders against the local lane - (a) a VRAM row resident on the
+      # worker's card, (b) a RAM row, (c) a row the daemon does not hold - and the per-pick time through the
+      # protocol.  Skipped with a note on a machine whose cards this worker has no code for (this tree's gfx1200).
+      add_executable(peer_compute_hip_test tests/peer_compute_hip_test.cpp src/ds4/ds4_peer_tier.cpp
+                       src/ds4/ds4_iq_cpu.cpp)
+      target_include_directories(peer_compute_hip_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/ds4
+                                ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
+      target_link_libraries(peer_compute_hip_test PRIVATE strata_peer strata_kernels_cpu)
+      target_compile_definitions(peer_compute_hip_test PRIVATE STRATA_HAVE_PEER=1
+                                 STRATA_PEER_BIN="$<TARGET_FILE:strata-peer>"
+                                 STRATA_PEER_COMPUTE_HIP_SO="$<TARGET_FILE:strata_peer_compute_hip>")
+      add_test(NAME peer_compute_hip_test COMMAND peer_compute_hip_test)
+      set_tests_properties(peer_compute_hip_test PROPERTIES TIMEOUT 300)
+    endif()
+  endif()
   # DeepSeek's DSpark markov head as Q8_0 blocks (DS4_MARKOV_Q8, src/ds4/ds4_markov_q8.hpp) byte for byte against
   # ggml's quantize_row_q8_0_ref, a head group member's rows against the whole head's (no GPU)
   add_executable(ds4_markov_q8_test tests/ds4_markov_q8_test.cpp)

@@ -218,6 +218,7 @@ bool Ctl::connect(const std::string& host, int port, int timeout_ms, std::string
         return false;
     }
     (void) timeout_ms;              // the caller's recv/send timeouts cover the slow-peer case
+    body_timeout_ms_ = timeout_ms;   // ... and the body's, which has no deadline of its own
     return true;
 }
 
@@ -320,6 +321,57 @@ std::string Ctl::recv(int timeout_ms, std::string& err) {
         }
         line_.append(buf, (size_t) n);
     }
+}
+
+bool Ctl::send_body(const void* p, size_t bytes, std::string& err) {
+    // the header line's send was the flush: a body is the same frame's continuation, so one write_all
+    return write_all(p, bytes, err);
+}
+
+bool Ctl::recv_body(void* p, size_t bytes, std::string& err) {
+    char* out = (char*) p;
+    // the header line's getline over-read whatever followed it, and that is this body's first bytes
+    if (!line_.empty()) {
+        const size_t n = bytes < line_.size() ? bytes : line_.size();
+        std::memcpy(out, line_.data(), n);
+        line_.erase(0, n);
+        out += n;
+        bytes -= n;
+    }
+    timespec deadline = {};
+    const bool forever = body_timeout_ms_ < 0;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += body_timeout_ms_ / 1000;
+    deadline.tv_nsec += (body_timeout_ms_ % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+        deadline.tv_nsec %= 1000000000L;
+    }
+    while (bytes > 0) {
+        timespec now = {};
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (!forever && (now.tv_sec > deadline.tv_sec ||
+                         (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))) {
+            err = "ctl body recv timed out after " + std::to_string(body_timeout_ms_) + " ms";
+            return false;
+        }
+        const int wait = forever ? -1
+                       : (int) ((deadline.tv_sec - now.tv_sec) * 1000 +
+                                (deadline.tv_nsec - now.tv_nsec) / 1000000);
+        pollfd pfd = {fd_, POLLIN, 0};
+        if (poll(&pfd, 1, wait <= 0 ? 1 : wait) <= 0) continue;
+        const ssize_t n = ::recv(fd_, out, bytes, MSG_DONTWAIT);
+        if (n <= 0) {
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;   // spurious wake
+            err = std::string("ctl body recv failed: ") +
+                  (n < 0 ? std::strerror(errno) : "peer closed");
+            closed_ = true;
+            return false;
+        }
+        out += n;
+        bytes -= (size_t) n;
+    }
+    return true;
 }
 
 }   // namespace strata::peer

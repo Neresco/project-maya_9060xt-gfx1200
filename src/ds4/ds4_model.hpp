@@ -64,6 +64,11 @@ struct Options {
     int prefill_chunk = -1;
     bool vision = true;               // the vision tower (the checkpoint's vision.* / aligner.*), when it has one
     bool vision_only = false;         // (tests) load the vision tower alone: encode_image() and nothing else
+    std::string peer;                 // (--peer) Phase 3's peer expert tier: the other machine's strata-peer control
+                                      // address (ds4_peer_tier.hpp).  Unset: every read on this machine's disks
+    int peer_port = 0;                // (--peer-port; 0: the daemon's 9447, or STRATA_DS4_PEER_PORT)
+    std::string peer_device;          // (--peer-device; empty: the first ibverbs device)
+    std::vector<int> peer_shards;     // (--peer-shards) the pack files the PEER holds (empty: all of them)
     bool verbose = false;
     // abliteration (ds4_ablate.hpp): a refusal direction projected out of every residual write.  The direction file
     // (a llama-cvector-generator GGUF, or a rank-1 abliteration adapter GGUF), which of its directions (1-based; 0: the

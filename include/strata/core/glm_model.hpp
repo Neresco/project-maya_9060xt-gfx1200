@@ -595,6 +595,15 @@ public:
     void fast_service();
     // gate / up / down of one expert from the shards (or its chunk-th of n_chunks pieces)
     void fast_read_part(int il, int e, int role, uint8_t* blob, int chunk = 0, int n_chunks = 1);
+    // Phase 3 (--peer): the RDMA peer tier - its row table from the pack's expert layout and the local
+    // copies of the RAM tier and the staging buffer offered to the NIC as READ destinations, so a layer's
+    // misses can be pulled off the peer's slab instead of the local disk.  A refusal is reported and the
+    // disk path runs unchanged; the session is process-wide (a split's parts share one QP).
+    bool fast_peer_open(std::string& err);
+    // ... one layer's missed experts (kSpares of them, three parts each) into `dst[m]`; `ok[k]` per row.
+    // Returns how many rows landed, and never fails the caller: what it cannot serve is read from disk.
+    int fast_peer_serve(int il, const int* ids, const int* mi, const int* rd, int nr, uint8_t* const* dst,
+                        int* served_rd);
     void fast_read_expert_x3(int il, int e, uint8_t* blob);   // a whole EXL3 expert in as few reads as it allows
     void fast_ahead_route(int il, const int* ids, unsigned int miss, const short (*ahead)[8]);   // LOOKAHEAD
     void fast_ahead_reader();

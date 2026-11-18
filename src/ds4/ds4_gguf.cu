@@ -25,6 +25,20 @@
 #include <chrono>
 
 namespace strata::ds4::gguf {
+
+// (--peer-compute) a decode lane's row, rounded here (its x rows are on the host already): q8_quant_row's arithmetic,
+// a 32-block at a pass - max|x| / 127 for the scale and round-to-nearest for the code (lrintf rounds as
+// __float2int_rn does), so the peer's sums of a token carry what a device's q8 job would have handed it
+void q8_quant_row_host(const float* xr, int k, int8_t* q, float* d) {
+    for (int b = 0; b < k / 32; ++b) {
+        const float* xb = xr + (size_t) b * 32;
+        float am = 0.0f;
+        for (int j = 0; j < 32; ++j) am = fmaxf(am, fabsf(xb[j]));
+        const float sc = am / 127.0f;
+        for (int j = 0; j < 32; ++j) q[(size_t) b * 32 + j] = (int8_t) (am > 0.0f ? lrintf(xb[j] / sc) : 0);
+        d[b] = sc;
+    }
+}
 namespace {
 
 std::atomic<int> g_errors{0};
@@ -205,16 +219,22 @@ __device__ __forceinline__ void q8_block(const uint8_t* __restrict__ p, float* w
 // ---- int8 activations (llama.cpp's MMVQ: its q8_1 blocks' rounding)
 // rows of k F32 values (row r at x + r ldx; k % 32 == 0) -> q[r][k] int8 and d[r][k / 32] = max|x| / 127 per 32
 // (a warp a 32-block: row r's block b)
-__device__ __forceinline__ void q8_quant_block(const float* __restrict__ x, size_t ldx, int k, int8_t* __restrict__ q,
-                                               float* __restrict__ d, int r, int b, int lane) {
+// a row's block b (the warp's): `xr` is the row's own first value (x + r ldx), `qr` its index in the int8 buffer - a
+// gathered row's source and its destination are two different rows, which is why they are apart
+__device__ __forceinline__ void q8_quant_row(const float* __restrict__ xr, int k, int8_t* __restrict__ q,
+                                             float* __restrict__ d, int qr, int b, int lane) {
     if (b * 32 >= k) return;
-    const float v = x[(size_t) r * ldx + (size_t) b * 32 + lane];
+    const float v = xr[(size_t) b * 32 + lane];
     float am = fabsf(v);
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
     const float sc = am / 127.0f;
-    q[(size_t) r * k + (size_t) b * 32 + lane] = (int8_t) (am > 0.0f ? __float2int_rn(v / sc) : 0);
-    if (lane == 0) d[(size_t) r * (k / 32) + b] = sc;
+    q[(size_t) qr * k + (size_t) b * 32 + lane] = (int8_t) (am > 0.0f ? __float2int_rn(v / sc) : 0);
+    if (lane == 0) d[(size_t) qr * (k / 32) + b] = sc;
+}
+__device__ __forceinline__ void q8_quant_block(const float* __restrict__ x, size_t ldx, int k, int8_t* __restrict__ q,
+                                               float* __restrict__ d, int r, int b, int lane) {
+    q8_quant_row(x + (size_t) r * ldx, k, q, d, r, b, lane);
 }
 __global__ void __launch_bounds__(kThreads) q8_quant_kernel(const float* __restrict__ x, size_t ldx, int k,
                                                             int8_t* __restrict__ q, float* __restrict__ d) {
@@ -226,7 +246,22 @@ void q8_quant(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, 
     const dim3 grid((unsigned) ((k / 32 + kWarps - 1) / kWarps), (unsigned) rows);
     pdl_launch(q8_quant_kernel, grid, kThreads, 0, s, x, ldx, k, q, d);
 }
-// (DS4_Q8_BATCH) a mv call's int8 inputs in one launch: job z's rows as q8_quant_kernel rounds them, bit for bit -
+// (--peer-compute) THE SAME ROWS, GATHERED: a flow's expert rows are a sorted set of picks, not a contiguous block,
+// so row r of the batch is x's row idx[r] - rounded exactly as q8_quant_kernel rounds a row of its own (one function,
+// so the peer's sums carry the lane's int8 codes bit for bit)
+__global__ void __launch_bounds__(kThreads) q8_quant_rows_kernel(const float* __restrict__ x, size_t ldx,
+                                                                const int* __restrict__ idx, int k,
+                                                                int8_t* __restrict__ q, float* __restrict__ d) {
+    pdl_wait();
+    pdl_trigger();
+    q8_quant_row(x + (size_t) idx[blockIdx.y] * ldx, k, q, d, blockIdx.y, blockIdx.x * kWarps + (threadIdx.x >> 5),
+                 threadIdx.x & 31);
+}
+void q8_quant_rows(const float* x, size_t ldx, const int* idx, int rows, int k, int8_t* q, float* d, cudaStream_t s) {
+    if (rows <= 0) return;
+    const dim3 grid((unsigned) ((k / 32 + kWarps - 1) / kWarps), (unsigned) rows);
+    pdl_launch(q8_quant_rows_kernel, grid, kThreads, 0, s, x, ldx, idx, k, q, d);
+}// (DS4_Q8_BATCH) a mv call's int8 inputs in one launch: job z's rows as q8_quant_kernel rounds them, bit for bit -
 // the same warp a 32-block; a job's blocks past its k and rows past its rows end at once
 struct Q8Job {
     const float* x;

@@ -395,6 +395,9 @@ int64_t zfs_arc_reclaimable();
 bool route_dumping();
 void route_dump(int layer, int k, const int* ids, const float* w);
 
+// Phase 3's peer expert tier (src/core/glm_peer_tier.hpp): one session a process, the split's parts sharing it.
+class PeerTier;
+
 // The expert usage file (opt-in, as Strata keeps nothing between starts but --expert-profile-save's profile):
 // STRATA_GLM_USAGE=<file>; unset or 0, none - the warm-up and the split search then go by the expert profile
 std::string usage_file();
@@ -896,7 +899,11 @@ struct Glm5Model::FastState {
     float miss_w_req = -1.0f;
     int miss_from_req = -1;
     std::atomic<uint64_t> scratch_uses{0}, demotions{0}, drops{0};
-    std::atomic<uint64_t> miss_us{0}, disk_us{0};
+    std::atomic<uint64_t> miss_us{0}, disk_us{0}, peer_us{0};   // peer_us: the miss path's RoCE pull
+    // ---- PHASE 3: THE PEER EXPERT TIER (--peer / STRATA_GLM_PEER).  One session a process: the daemon's
+    //      slab is the resource, and it serves one initiator - so a split's parts share this and serve()
+    //      serialises them.  nullptr: the tier is off (or refused), and every miss is the disk path.
+    glmfast::PeerTier* peer = nullptr;
     uint64_t tokens = 0;
     double ms = 0;
     bool timing = false;

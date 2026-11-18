@@ -121,7 +121,12 @@ __device__ __forceinline__ void load_tab(uint32_t* tab) {
 // there every rounding is explicit (no contraction, barriers the compiler cannot fold through) and IQ4_XS's rows load
 // in 16-bit halves.  Elsewhere - gfx11 and the other AMD GPUs, CUDA - the kernels compile as before (the same bits and
 // speed as v1.1.30: the barriers cost a Strix Halo ~7% of its decode).
-#if defined(STRATA_USE_HIP) && defined(__clang__) && (defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx906__))
+// An explicit -DSTRATA_DS4_IQ_STRICT_FP wins over the arch test, and that is what the peer compute worker
+// (src/peer/peer_compute_hip.cu) asks for on gfx11: a peer card's sums have to match the local gfx1200 lane's,
+// not gfx11's own default, and the ~7% of decode it costs is paid only inside that worker.
+#if defined(STRATA_DS4_IQ_STRICT_FP)
+#define DS4_IQ_STRICT_FP STRATA_DS4_IQ_STRICT_FP
+#elif defined(STRATA_USE_HIP) && defined(__clang__) && (defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx906__))
 #define DS4_IQ_STRICT_FP 1
 #else
 #define DS4_IQ_STRICT_FP 0

@@ -132,6 +132,8 @@ void usage() {
                  "           [--vision on|off] [--mmap-experts on|off|auto] [--experts N (lossy: the router's top N)]\n"
                  "           [--parallel N (--serve: N conversations at once)]\n"
                  "           [--ssd-cache GB|auto|off [--ssd-policy lru|lfu]]   (the in-place experts in a RAM store; opt-in)\n"
+                 "           [--peer HOST [--peer-port N] [--peer-device IBV] [--peer-shards 0,1,...]]   (the experts the\n"
+                 "            other machine's strata-peer serves over RoCE: the pack files IT holds, as the pack numbers them)\n"
                  "           [--ablate DIRECTION.gguf|ADAPTER.gguf [--ablate-layer N] [--ablate-scale F]]\n"
                  "           (--ids I,J,... | @FILE [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n"
@@ -3618,6 +3620,27 @@ int main(int argc, char** argv) {
         else if (a == "--temperature") temp = (float) std::atof(val("--temperature").c_str());
         else if (a == "--seed") cli_seed = std::strtoull(val("--seed").c_str(), nullptr, 10);
         else if (a == "--verbose" || a == "-v") o.verbose = true;
+        // (--peer) Phase 3's peer expert tier: the other machine's strata-peer serves the experts this run would read
+        // from its disks (ds4_peer_tier.hpp).  --peer-shards: which of the pack's files IT holds, numbered as the
+        // pack's own (--pack-info lists them) - its RAM is what caps them, not this machine's disk
+        else if (a == "--peer") o.peer = val("--peer");
+        else if (a == "--peer-port") {
+            o.peer_port = std::atoi(val("--peer-port").c_str());
+            if (o.peer_port < 1 || o.peer_port > 65535) {
+                std::fprintf(stderr, "--peer-port needs a port from 1 to 65535\n");
+                return 2;
+            }
+        }
+        else if (a == "--peer-device") o.peer_device = val("--peer-device");
+        else if (a == "--peer-shards") {
+            for (int s : parse_ids(val("--peer-shards"))) {
+                if (s < 0) {
+                    std::fprintf(stderr, "--peer-shards takes pack file numbers (0,1,...), not %d\n", s);
+                    return 2;
+                }
+                o.peer_shards.push_back(s);
+            }
+        }
         else if (a == "--version") {
             std::printf("maya-ds4 %s (build %s)\n", MAYA_RELEASE, MAYA_BUILD_ID);
             return 0;

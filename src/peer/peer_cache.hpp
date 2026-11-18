@@ -28,6 +28,28 @@ struct Row {
     static void (*alloc_log_)(uint64_t bytes);
 };
 
+/// An arena's backing, seen by fill() only as "a window rows are written into, the address the
+/// initiator reads them at, and the rkey": pinned system RAM (an MR over a malloc, the default) or,
+/// with the daemon's --vram, a GPU allocation registered as a dmabuf MR (peer_vram.cpp).  Hiding the
+/// difference here keeps one fill path, one row map and one eviction rule for both.
+class Slab {
+public:
+    virtual ~Slab() = default;
+    /// The CPU window rows are pread'd into, or null when a row has to go through put() instead (VRAM:
+    /// the pages belong to the GPU, so a read lands in a staging buffer and a copy carries it over).
+    virtual void* host() = 0;
+    /// Writes `bytes` at `off` (only used when host() is null: VRAM).
+    virtual bool put(size_t off, const void* src, size_t bytes, std::string& err) = 0;
+    /// The remote address a row starting at `off` is read at.
+    virtual uint64_t addr_at(size_t off) const = 0;
+    virtual size_t bytes() const = 0;
+    virtual uint32_t rkey() const = 0;
+    /// The HIP device ordinal this slab's memory belongs to, or -1 for host memory.  A row's address in
+    /// a device slab is a device address of that one card (peer_vram.cpp), so the compute worker's own
+    /// ordinal has to match it before a resident row can be handed over (PeerCache::dev_row).
+    virtual int gpu() const { return -1; }
+};
+
 /// A cached row: the arena that holds it and where (its rkey is the arena's MR's).
 struct Cached {
     uint32_t arena = 0;          // the arena's stable id
@@ -71,17 +93,47 @@ public:
     /// The rows the last fill evicted (the initiator clears its map for them).
     const std::vector<long long>& dropped() const { return dropped_; }
 
+    /// A held row's bytes as this daemon can read them - `len` bytes at `p` - for a compute worker:
+    /// false when the row is not held at all (never hinted, or evicted with its arena) or when it lives
+    /// in a --vram slab (a GPU allocation has no host window, so a CPU worker cannot read it).
+    bool host_row(long long ri, const void*& p, uint32_t& len) const;
+
+    /// A held row's own address for a compute worker that runs on a card - `len` bytes at `addr`, and the
+    /// HIP ordinal the memory belongs to in `gpu` - false for a row in the RAM slab (host memory: the worker
+    /// would copy it, which is what host_row is for) and for one that is not held at all.  The address is a
+    /// device address of that card alone: the caller compares `gpu` with the worker's own ordinal.
+    bool dev_row(long long ri, uint64_t& addr, uint32_t& len, int& gpu) const;
+
+    /// Opt-in VRAM tier (the daemon's --vram <gpu>:<gb>, repeatable).  Each spec is one slab of
+    /// exactly `bytes`, allocated and dmabuf-registered here at start-up: a GPU that cannot hand out
+    /// a dmabuf MR (or has ComfyUI on it) stops the daemon with the reason instead of failing a fill
+    /// mid-session.  Rows take VRAM first, in spec order, and spill into the RAM slab when every VRAM
+    /// slab that could hold them is full - so the tier is a fast path, never a cliff.
+    bool add_vram(int gpu, uint64_t bytes, std::string& err);
+
+    /// The bytes this daemon can hold at all: the RAM slab's budget plus every --vram slab (a spec a card could
+    /// not give is no slab).  The initiator caps the rows it asks the peer to keep resident at hello by this.
+    uint64_t capacity_bytes() const { return budget_ + vram_total_; }
+    /// The --vram slabs' bytes in all (0: the peer has no card in this tier).
+    uint64_t vram_capacity() const { return vram_total_; }
     uint64_t cached_bytes() const { return cached_bytes_; }
+    /// The cached bytes that live in a --vram slab rather than in the pinned RAM slab.
+    uint64_t vram_bytes() const { return cached_bytes_ - ram_bytes_; }
     uint64_t budget() const { return budget_; }
     size_t cached_rows() const { return where_.size(); }
     size_t arenas() const { return arenas_.size(); }
 
 private:
     struct ArenaRec {
-        std::unique_ptr<Mr> mr;
+        std::unique_ptr<Slab> slab;
         size_t used = 0;                    // bump pointer
         uint64_t stamp = 0;                 // LRU: bumped whenever one of its rows is touched
+        int pool = 0;                       // 0 = the RAM slab, 1.. = a --vram spec, in order
     };
+
+    /// The VRAM slab that can hold `bytes` (a pool's slab is exactly its spec, so it is never
+    /// evicted, only filled), or {0, nullptr}.  No stamp bump: the caller does it once it lands.
+    std::pair<uint32_t, ArenaRec*> pick_vram(size_t bytes);
 
     /// An arena with room for `bytes` (bumped to `stamp`, its stable id in *id_out), a fresh one
     /// under the budget, or null after evicting LRU arenas whole (their rows into dropped_) -
@@ -90,14 +142,18 @@ private:
     void drop_arena(uint32_t id);
 
     uint64_t budget_ = 0, arena_bytes_ = 0;
+    uint64_t vram_total_ = 0;           // (the --vram slabs' bytes: capacity_bytes beside the RAM budget)
     Device* dev_ = nullptr;
     std::vector<int> shard_fd_;
     std::vector<uint64_t> shard_size_;
     std::unordered_map<uint32_t, ArenaRec> arenas_;
     uint32_t next_arena_ = 0;
+    uint32_t next_pool_ = 1;             // (pool 0 is the RAM slab)
     std::unordered_map<long long, Cached> where_;
     std::vector<long long> dropped_;
-    uint64_t cached_bytes_ = 0;
+    std::vector<char> stage_;            // the pread landing zone for a VRAM row
+    uint64_t cached_bytes_ = 0;          // every row in the cache (RAM + VRAM): the log's number
+    uint64_t ram_bytes_ = 0;             // the rows the RAM budget actually pays for
     uint64_t clock_ = 0;
     static void (*alloc_log_)(uint64_t bytes);
 };

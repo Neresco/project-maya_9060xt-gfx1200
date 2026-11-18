@@ -86,6 +86,13 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre);
 /// The int8 rounding mv gives a kFmtQ8_0 job's one F32 input of k values (DS4_Q8_BATCH: its batched launch's, else the
 /// per-job one's) - what the HC fuse check compares hc_split_pre_norm's against.
 void q8_round(const float* x, int k, int8_t* q, float* d, cudaStream_t s);
+/// (--peer-compute) `rows` activation rows GATHERED by index - row r is x's row idx[r] (the flow's rows are a sorted set
+/// of picks, not a contiguous block) - rounded exactly as q8_round's are: what the peer's compute order carries.
+void q8_quant_rows(const float* x, size_t ldx, const int* idx, int rows, int k, int8_t* q, float* d, cudaStream_t s);
+/// The same rounding ON THE HOST, one row of k values: the decode lane's x rows are already here (the picks' activations
+/// were copied to the host), so its peer orders are quantized where they lie - the same int8 codes and scales as
+/// q8_quant_row's, bit for bit (a 32-block a pass: sc = max|x| / 127, the code rounded to the nearest int8).
+void q8_quant_row_host(const float* xr, int k, int8_t* q, float* d);
 /// The columns [c0, c0 + nc) of such a matrix: its rows c0 .. c0 + nc - 1, a contiguous range.
 x3::Mat view(const x3::Mat& m, int c0, int nc);
 /// x3::reconstruct_rows' layout from a BF16 or Q8_0 matrix: dst[r][c] = W[c][r] (n rows of k values), F16 or BF16

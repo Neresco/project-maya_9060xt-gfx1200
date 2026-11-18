@@ -9,8 +9,27 @@
 // exactly the reason the engine's RAM tier is (a container's /proc/meminfo is the host's).
 //
 // Usage: strata-peer --pack <dir> [--bind <ip>] [--port 9447] [--ram-gb <n>] [--arena-mb <n>]
-//                     [--device <ibv device>] (-x: a budget of 0 probes a quarter of what is free)
+//                     [--device <ibv device>] [--vram <gpu>:<gb>]... [--compute <worker .so>]
+//                     [--compute-options <str>]
+//                     (-x: a budget of 0 probes a quarter of what is free)
+//
+// --vram is the opt-in VRAM tier (peer_vram.cpp): one slab per spec, held in that card's VRAM and
+// registered as a dmabuf MR, so hinted rows land there instead of in the pinned RAM slab.  Off by
+// default, repeatable, and start-up-fatal when it cannot be honoured - a peer whose card is busy with
+// ComfyUI should say so on the spot, not fail a fill an hour later.
+//
+// --compute is the opt-in compute tier (peer_compute.cpp, docs/PEER_COMPUTE.md): a worker shared object
+// the daemon loads by path and hands compute orders to, so the peer computes the experts it holds instead
+// of only serving their bytes.  Absent: storage only, exactly as before.  Given and not loadable: a start-up
+// error, the same contract as --vram (a worker that cannot start must not surface at the third layer of a
+// decode).  The daemon still links no GPU runtime: the worker is the only place one could ever live.
+//
+// --compute-options is the string the worker itself reads (its open()'s argument): a HIP worker takes
+// "gpu:<ordinal>" to name the peer card it should compute on, and without it picks the machine's first one.
+// The daemon never interprets it; it only compares the card the worker reports back with the ordinal of a
+// --vram slab before it hands that slab's rows over (peer_compute_abi.h).
 #include "peer_cache.hpp"
+#include "peer_compute.hpp"
 #include "peer_ctl.hpp"
 #include "peer_rdma.hpp"
 
@@ -20,15 +39,33 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <memory>
+#include <utility>
+#include <vector>
 
 namespace strata::peer {
 
 namespace {
+
+/// The compute workers' caps lines as ONE welcome field: " | " between them, so a daemon with two cards' workers
+/// names both (the client keeps the field as the tier's own description and asks nothing of its shape).
+std::string compute_caps(const std::vector<ComputeWorker*>& w) {
+    std::string s;
+    for (ComputeWorker* x : w) {
+        if (x == nullptr) continue;
+        if (!s.empty()) s += " | ";
+        s += x->caps();
+    }
+    return s;
+}
 
 /// One session's serving state (a borrowed cache and a borrowed cm listener per accepted
 /// connection - one initiator at a time, so the listener's child id serves this session alone).
@@ -38,6 +75,8 @@ struct Session {
                                     // the cache's arena MRs (one PD, or the RDMA reads break)
     Qp qp;                          // this session's RC QP (armed from the client's qp-up)
     PeerCache* cache;
+    std::vector<ComputeWorker*> workers;   // the daemon's --compute workers, one per flag (empty: storage only)
+    int w_rr = 0;                          // (the worker a RAM-slab job goes to next: any of them takes one)
     std::vector<Row> rows;
     std::string pack_dir;
     uint64_t clock_stamp = 0;       // the session's LRU stamps (one initiator at a time)
@@ -46,6 +85,7 @@ struct Session {
     bool handshake(std::string& err);
     int hello_window = 48;          // the client's window (identifies this session in the log)
     bool on_hint(const JsonView& hint, std::string& err);
+    bool on_compute(const JsonView& line, std::string& err);
 };
 
 bool Session::handshake(std::string& err) {
@@ -59,7 +99,10 @@ bool Session::handshake(std::string& err) {
         return false;
     }
     const Json welcome = Json().add("type", "welcome").add("proto", 1)
-                             .add("budget_gb", (long long) (cache->budget() >> 30));
+                             .add("budget_gb", (long long) (cache->budget() >> 30))
+                             .add("cap", (long long) cache->capacity_bytes())
+                             .add("vram", (long long) cache->vram_capacity())
+                             .add("compute", compute_caps(workers));
     if (!ctl.send(welcome.str(), err)) return false;
     // the manifest: names + sizes + the client's own fingerprint of its copy - a mismatch refuses
     const JsonView man(ctl.recv(30000, err));
@@ -145,7 +188,9 @@ bool Session::handshake(std::string& err) {
                       .add("psn", (long long) qp.psn()).add("gid", qp.gid()).str(), err)) {
         return false;
     }
-    say("session up: budget " + std::to_string(cache->budget() >> 20) + " MiB, window " +
+    say("session up: budget " + std::to_string(cache->budget() >> 20) + " MiB (capacity " +
+        std::to_string(cache->capacity_bytes() >> 20) + " MiB with its VRAM slabs" +
+        (!workers.empty() ? ", compute " + compute_caps(workers) : ", storage only") + "), window " +
         std::to_string(window));
     return true;
 }
@@ -174,7 +219,162 @@ bool Session::on_hint(const JsonView& hint, std::string& err) {
     say("hint: " + std::to_string(want.size()) + " rows, " +
         std::to_string(cache->cached_bytes() >> 20) + " MiB cached (" +
         std::to_string(cache->cached_rows()) + " rows, " + std::to_string(cache->arenas()) +
-        " arenas)");
+        " arenas" + (cache->vram_bytes() ? ", " + std::to_string(cache->vram_bytes() >> 20) +
+                                                    " MiB of it in VRAM" : "") + ")");
+    return true;
+}
+
+bool Session::on_compute(const JsonView& line, std::string& err) {
+    const long long n = line.num("n", 0);
+    const long long n_embd = line.num("n_embd", 0), n_ff = line.num("n_ff", 0);
+    const std::vector<long long> nrows = line.nums("rows");
+    // EVERY LENGTH OF THE BODY IS DERIVED FROM THIS HEADER, so a header that does not frame one cannot be
+    // skipped over and the stream cannot be resynchronised: it ends the session with the reason, the way a map
+    // line with mismatched arrays does.  (A job this daemon cannot serve is still ok = 0 and the session lives -
+    // only a header that is not this protocol's is a session's end.)
+    if (n < 0 || n > 64 || (long long) nrows.size() != n) {
+        err = "a compute header of " + std::to_string(n) + " jobs and " + std::to_string(nrows.size()) +
+              " row counts frames no body";
+        return false;
+    }
+    if (n > 0 && (n_embd <= 0 || n_ff <= 0 || n_embd % 32 != 0 || n_embd > 65536 || n_ff > 65536)) {
+        err = "a compute batch of " + std::to_string(n_embd) + " x " + std::to_string(n_ff) +
+              " is not a layer's geometry";
+        return false;
+    }
+    for (long long rows : nrows) {
+        if (rows <= 0 || rows > 8) {   // (one line is one layer's picks: past that it is not a batch)
+            err = "a compute job of " + std::to_string(rows) + " rows frames no body";
+            return false;
+        }
+    }
+    const bool has_w = line.num("has_w", 0) != 0;   // (all-or-nothing a batch: every job carries its rows)
+    // the bodies are read into these and stay alive until the worker's run returns: it reads them in place,
+    // the wire is the only copy.  WHICH WORKER A JOB GOES TO is decided here, one job at a time: a --vram row
+    // has no host window, so only the worker that computes on the card that allocated it may take it; a RAM
+    // slab's rows are host bytes any worker takes (they go to the workers in turn, so two cards' workers each
+    // get a share of a layer's orders)
+    std::vector<std::vector<int8_t>> xq((size_t) n);
+    std::vector<std::vector<float>> xd((size_t) n), wt((size_t) n), y((size_t) n);
+    std::vector<strata_peer_job> jobs((size_t) n);
+    std::vector<long long> at;   // (the jobs this daemon can serve, in the request's order)
+    std::vector<int> wsel((size_t) n, -1);   // (each job's worker: the index into workers, -1: nowhere)
+    int n_resident = 0;          // (of those, the ones a worker computes in the card's VRAM)
+    for (long long k = 0; k < n; ++k) {
+        const std::string p = "j" + std::to_string(k);
+        const long long rows = nrows[(size_t) k];
+        const int32_t tg = (int32_t) line.num(p + "_tg", -1), td = (int32_t) line.num(p + "_td", -1);
+        const size_t nq = (size_t) rows * (size_t) n_embd, nd = (size_t) rows * (size_t) (n_embd / 32);
+        // the body is positional: every job's bytes are taken whatever this daemon can serve of it, or the
+        // next job's would be read at this one's offsets
+        xq[(size_t) k].resize(nq);
+        xd[(size_t) k].resize(nd);
+        wt[(size_t) k].resize((size_t) rows);
+        if (!ctl.recv_body(xq[(size_t) k].data(), nq, err) ||
+            !ctl.recv_body(xd[(size_t) k].data(), nd * sizeof(float), err) ||
+            (has_w && !ctl.recv_body(wt[(size_t) k].data(), (size_t) rows * sizeof(float), err))) {
+            return false;
+        }
+        if (!has_w) std::fill(wt[(size_t) k].begin(), wt[(size_t) k].end(), 1.0f);
+        if (tg < 0 || td < 0) continue;   // (not a job this tier serves)
+        // the three rows as this daemon holds them, and in which of its two tiers: a row it does not
+        // hold (never hinted, or evicted with its arena), or one whose tier no worker can take, is the
+        // caller's own work, and no byte of it moves
+        const long long gri = line.num(p + "_gate", -1), uri = line.num(p + "_up", -1),
+                        dri = line.num(p + "_down", -1);
+        const void* gate = nullptr;
+        const void* up = nullptr;
+        const void* down = nullptr;
+        uint32_t glen = 0, ulen = 0, dlen = 0;
+        int resident = 0, w = -1;
+        if (cache->host_row(gri, gate, glen) && cache->host_row(uri, up, ulen) &&
+            cache->host_row(dri, down, dlen)) {
+            resident = 0;   // (the pinned RAM slab: host bytes the worker copies into its own memory)
+            if (!workers.empty()) w = w_rr++ % (int) workers.size();   // (any of them takes host bytes)
+        } else {
+            // a --vram row has no host window at all, so the worker is handed the slab's own device
+            // address and computes it in place - on the card that allocated it and no other: the slab knows
+            // its ordinal, the worker named its own in its version() line, and the two have to agree.
+            // (a row on another card is the caller's own work: the address means nothing there)
+            uint64_t ga = 0, ua = 0, da = 0;
+            int gg = -1, ug = -1, dg = -1;
+            if (!cache->dev_row(gri, ga, glen, gg) || !cache->dev_row(uri, ua, ulen, ug) ||
+                !cache->dev_row(dri, da, dlen, dg) || gg != ug || gg != dg)
+                continue;   // (not one slab's three rows: no worker reads across two cards)
+            for (size_t i = 0; i < workers.size(); ++i)
+                if (workers[i]->gpu() == gg) w = (int) i;
+            if (w < 0) continue;   // (in VRAM, and no worker of this daemon computes on that card)
+            gate = (const void*) (uintptr_t) ga;
+            up = (const void*) (uintptr_t) ua;
+            down = (const void*) (uintptr_t) da;
+            resident = 1;
+        }
+        if (ulen != glen) continue;   // (one expert's gate and up are the same shape: a table says otherwise)
+        if (w < 0) continue;
+        y[(size_t) k].resize(nq);   // (the worker's own sums: written only for a job it serves)
+        strata_peer_job& j = jobs[(size_t) k];
+        j.n_embd = (int32_t) n_embd;
+        j.n_ff = (int32_t) n_ff;
+        j.tg = tg;
+        j.td = td;
+        j.n_rows = (int32_t) rows;
+        // (the scanner keeps a number as its text: strtod reads the float the client wrote)
+        j.limit = (float) std::strtod(line.str(p + "_lim", "0").c_str(), nullptr);
+        j.gate = (const uint8_t*) gate;
+        j.up = (const uint8_t*) up;
+        j.down = (const uint8_t*) down;
+        j.gate_bytes = glen;
+        j.down_bytes = dlen;
+        j.xq = xq[(size_t) k].data();
+        j.xd = xd[(size_t) k].data();
+        j.w = wt[(size_t) k].data();
+        j.y = y[(size_t) k].data();
+        j.resident = resident;
+        wsel[(size_t) k] = w;
+        at.push_back(k);
+        if (resident != 0) ++n_resident;
+    }
+    std::vector<uint8_t> ok(at.size(), 0);
+    // one batch a worker: the jobs it took, in the request's order (a worker that fails the batch answers 0
+    // for every job of its own and the others go on - a card's worker is not the daemon)
+    for (size_t wi = 0; wi < workers.size(); ++wi) {
+        std::vector<strata_peer_job> batch;
+        std::vector<size_t> whence;
+        for (size_t i = 0; i < at.size(); ++i)
+            if (wsel[(size_t) at[i]] == (int) wi) batch.push_back(jobs[(size_t) at[i]]), whence.push_back(i);
+        if (batch.empty()) continue;
+        std::vector<uint8_t> o(batch.size(), 0);
+        std::string why;
+        if (!workers[wi]->run(batch.data(), (int) batch.size(), o.data(), why)) say("compute: " + why);
+        for (size_t i = 0; i < whence.size(); ++i) ok[whence[i]] = o[i];
+    }
+    // the answer: the request's own indices and one ok each (a job the worker refused, and every job of a
+    // daemon with no worker at all, is 0 - the caller computes those itself), then the sums as one body in the
+    // same order (41 KB where hex was 82 KB, and neither side pays a hex encode a buffer)
+    Json out;
+    out.add("type", "computed");
+    std::vector<long long> idx, served;
+    size_t done = 0, bytes = 0;
+    for (size_t i = 0; i < at.size(); ++i) {
+        idx.push_back(at[i]);
+        served.push_back(ok[i] ? 1 : 0);
+        if (ok[i] == 0) continue;
+        ++done;
+        bytes += y[(size_t) at[i]].size() * sizeof(float);
+    }
+    out.add("i", idx).add("ok", served).add("body", (long long) bytes);
+    std::string body;
+    body.reserve(bytes);
+    for (size_t i = 0; i < at.size(); ++i) {
+        if (ok[i] == 0) continue;
+        const std::vector<float>& sum = y[(size_t) at[i]];
+        body.append((const char*) sum.data(), sum.size() * sizeof(float));
+    }
+    if (!ctl.send(out.str(), err) || !ctl.send_body(body.data(), body.size(), err)) return false;
+    say("compute: " + std::to_string(done) + " of " + std::to_string(n) + " jobs served (" +
+        (!workers.empty() ? std::string("with ") + compute_caps(workers) : std::string("no worker, storage only")) +
+        (n_resident != 0 ? ", " + std::to_string(n_resident) + " in VRAM" : "") +
+        ", window " + std::to_string(hello_window) + ")");
     return true;
 }
 
@@ -190,6 +390,10 @@ bool Session::serve(std::string& err) {
             say("hint in: " + std::to_string(line.nums("rows").size()) + " rows (window " +
                 std::to_string(hello_window) + ")");
             if (!on_hint(line, err)) return false;
+        } else if (line.type() == "compute") {
+            say("compute in: " + std::to_string(line.num("n", 0)) + " jobs (window " +
+                std::to_string(hello_window) + ")");
+            if (!on_compute(line, err)) return false;
         } else if (line.type() == "ping") {
             if (!ctl.send(Json().add("type", "pong").str(), err)) return false;
         } else if (line.type() == "bye") {
@@ -213,6 +417,8 @@ int main(int argc, char** argv) {
     std::string pack_dir = "pack", bind = "0.0.0.0", device = "";
     int port = 9447;
     long long ram_gb = 0, arena_mb = 0;
+    std::vector<std::pair<int, uint64_t>> vram;      // <gpu ordinal>:<GiB>, in the order given
+    std::vector<std::pair<std::string, std::string>> computes;   // --compute's .so, its own options (a card each)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -224,9 +430,34 @@ int main(int argc, char** argv) {
         else if (a == "--ram-gb") ram_gb = std::atoll(next().c_str());
         else if (a == "--arena-mb") arena_mb = std::atoll(next().c_str());
         else if (a == "--device") device = next();
+        else if (a == "--vram") {
+            const std::string spec = next();
+            const size_t colon = spec.find(':');
+            if (colon == std::string::npos) {
+                std::fprintf(stderr, "strata-peer: --vram wants <gpu>:<gb> (e.g. --vram 0:12), not \"%s\"\n",
+                             spec.c_str());
+                return 2;
+            }
+            const int gpu = std::atoi(spec.substr(0, colon).c_str());
+            const double gb = std::atof(spec.substr(colon + 1).c_str());
+            if (gpu < 0 || gb <= 0.0) {
+                std::fprintf(stderr, "strata-peer: --vram %s names no GPU or no bytes\n", spec.c_str());
+                return 2;
+            }
+            vram.emplace_back(gpu, (uint64_t) (gb * (double) (1ULL << 30)));
+        }
+        else if (a == "--compute") computes.emplace_back(next(), "");
+        else if (a == "--compute-options") {
+            if (computes.empty()) {
+                std::fprintf(stderr, "strata-peer: --compute-options comes after the --compute it is for\n");
+                return 2;
+            }
+            computes.back().second = next();
+        }
         else if (a == "-h" || a == "--help") {
             std::printf("usage: strata-peer --pack <dir> [--bind <ip>] [--port 9447] [--ram-gb <n>] "
-                        "[--arena-mb <n>] [--device <ibv device>]\n");
+                        "[--arena-mb <n>] [--device <ibv device>] [--vram <gpu>:<gb>]... "
+                        "[--compute <worker .so> [--compute-options <str>]]...\n");
             return 0;
         } else {
             std::fprintf(stderr, "strata-peer: unknown flag %s\n", a.c_str());
@@ -249,6 +480,26 @@ int main(int argc, char** argv) {
         strata::peer::say(err);
         return 1;
     }
+    // the VRAM tier, one slab per spec: allocated and registered here, so a card that cannot take it
+    // (busy, absent, or a NIC that cannot read it) is a start-up error with the reason
+    for (const auto& v : vram) {
+        if (!cache.add_vram(v.first, v.second, err)) {
+            strata::peer::say(err);
+            return 1;
+        }
+    }
+    // the compute workers, when asked for: one per --compute, each a card's (its options name the card).  A path
+    // that does not load is a start-up error, and a daemon without one serves storage only - every compute order
+    // then answers ok=0 and the caller computes it itself
+    std::vector<std::unique_ptr<strata::peer::ComputeWorker>> workers;
+    for (const auto& c : computes) {
+        std::unique_ptr<strata::peer::ComputeWorker> w = strata::peer::make_compute_worker(c.first, c.second, err);
+        if (w == nullptr) {
+            strata::peer::say(err);
+            return 1;
+        }
+        workers.push_back(std::move(w));
+    }
     // the listener: one session at a time; a session's end keeps the slab for the next one
     addrinfo hint = {}, *res = nullptr;
     hint.ai_family = AF_INET;
@@ -266,8 +517,14 @@ int main(int argc, char** argv) {
         return 1;
     }
     freeaddrinfo(res);
+    // (the workers as the welcome's field: their lines joined, so the client prints the daemon's own description)
+    std::vector<strata::peer::ComputeWorker*> wp;
+    for (const auto& w : workers) wp.push_back(w.get());
+    const std::string wcaps = strata::peer::compute_caps(wp);
     strata::peer::say("strata-peer listening on " + bind + ":" + std::to_string(port) +
-                      ", pack " + pack_dir);
+                      ", pack " + pack_dir +
+                      (vram.empty() ? "" : ", " + std::to_string(vram.size()) + " VRAM slab(s)") +
+                      (wcaps.empty() ? "" : ", compute " + wcaps));
     while (true) {
         // the previous session's qp async errors (a NAK'd read, a transport failure) surface here:
         // the device's async queue drains between connections
@@ -284,6 +541,7 @@ int main(int argc, char** argv) {
         if (conn < 0) continue;
         strata::peer::Session s;
         s.cache = &cache;
+        s.workers = wp;
         s.pack_dir = pack_dir;
         s.dev = &dev;
         if (!s.ctl.adopt(conn, err)) continue;
