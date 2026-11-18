@@ -211,7 +211,7 @@ void PeerTier::serve(int n, const long long* rows, const uint64_t* rel, const si
                      char* ok) {
     if (ok == nullptr || n <= 0) return;
     std::memset(ok, 0, (size_t) n);
-    std::lock_guard<std::mutex> lk(mu_);
+    std::unique_lock<std::mutex> lk(mu_);   // (dropped for the hint's round trip below: see there)
     if (!up_) return;
     const auto t0 = std::chrono::steady_clock::now();
     const size_t un = (size_t) n;
@@ -243,9 +243,16 @@ void PeerTier::serve(int n, const long long* rows, const uint64_t* rel, const si
     //    once, a cold one costs its pread on the peer's disk, and either way the reply advertises the rows so the
     //    batch below sees a settled map
     if (!hint.empty()) {
+        // (the round trip is off the lock: a cold hint costs the peer's own disk - a 30 s budget at least, minutes for
+        //  a slab's worth - while the decode lane's compute orders and every other queue wait on mu_, which is what
+        //  made a tiered decode stall behind a single hint.  The map is re-read below: a row that arrived is used, and
+        //  one that did not is the caller's own read)
         ++hints_;
         std::string err;
-        if (!impl_->cli.hint(hint, err)) {
+        lk.unlock();
+        const bool hinted = impl_->cli.hint(hint, err);
+        lk.lock();
+        if (!hinted) {
             if (!impl_->cli.is_up()) fail("the hint failed: " + err);   // (a refused hint leaves the session up)
             return;
         }
