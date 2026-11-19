@@ -69,6 +69,8 @@ struct Options {
     int peer_port = 0;                // (--peer-port; 0: the daemon's 9447, or STRATA_DS4_PEER_PORT)
     std::string peer_device;          // (--peer-device; empty: the first ibverbs device)
     std::vector<int> peer_shards;     // (--peer-shards) the pack files the PEER holds (empty: all of them)
+    bool peer_compute = false;        // (--peer-compute) the peer's worker sums the experts it holds, instead of only
+                                      // serving their bytes (docs/PEER_COMPUTE.md; a daemon without a worker: off)
     bool verbose = false;
     // abliteration (ds4_ablate.hpp): a refusal direction projected out of every residual write.  The direction file
     // (a llama-cvector-generator GGUF, or a rank-1 abliteration adapter GGUF), which of its directions (1-based; 0: the

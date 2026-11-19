@@ -87,7 +87,11 @@ __global__ void __launch_bounds__(256) hq_quant_kernel(const float* __restrict__
     __shared__ int s_at[8];
     const int r = (int) blockIdx.y, j = (int) threadIdx.x, lane = j & 31, w = j >> 5;
     const int at = (int) blockIdx.x * 256 + j;      // (the value of its 256-block)
-    const float v = h[(size_t) r * n_ff + at];
+    // (a row's swiglu sits at ENTRY r * kEntryStride in the scratch - the index grp_ent carries and gate_up_kernel
+    //  writes - not at r: reading it at r quantized row 0's block for every row after it, and the rows' down then
+    //  ran on zeros)
+    const size_t e_row = (size_t) r * kEntryStride;
+    const float v = h[e_row * n_ff + at];
     float am = fabsf(v);
     int ix = j;                                    // (the first index of the largest magnitude)
 #pragma unroll
@@ -107,7 +111,7 @@ __global__ void __launch_bounds__(256) hq_quant_kernel(const float* __restrict__
     int8_t qv = 0;
     float dv = 0.0f;
     if (amax > 0.0f) {
-        const float mx = h[(size_t) r * n_ff + (size_t) blockIdx.x * 256 + (size_t) s_at[0]];
+        const float mx = h[e_row * n_ff + (size_t) blockIdx.x * 256 + (size_t) s_at[0]];
         const float iscale = __fdiv_rn(-127.0f, mx);
         // (ggml's nearest_int: the magic number's rounding, halves to even)
         const float val = __fadd_rn(__fmul_rn(iscale, v), 12582912.0f);
@@ -117,7 +121,7 @@ __global__ void __launch_bounds__(256) hq_quant_kernel(const float* __restrict__
         dv = __fdiv_rn(1.0f, iscale);
     }
     // (the entries are 8 apart, as grp_ent spaces them: entry r * 8 of the scratch)
-    const size_t e = (size_t) r * kEntryStride;
+    const size_t e = e_row;
     q[e * n_ff + at] = qv;
     if (lane == 0) d[e * (n_ff / 32) + at / 32] = dv;
 }
@@ -217,6 +221,8 @@ struct Worker {
 
     /// Frees the scratch and the stream (a failed open's, or the daemon's close).
     void release() {
+        if (dev >= 0) (void) hipSetDevice(dev);   // (a free means the card that allocated it: the daemon's current
+                                                   //  device is the last worker's or a slab's, not this one's)
         if (stream != nullptr) (void) hipStreamDestroy(stream);
         stream = nullptr;
         if (d_w != nullptr) (void) hipFree(d_w);
@@ -433,20 +439,20 @@ bool serve(const strata_peer_job* jobs, int n, const std::vector<char>& take, st
     }
     // a host job's three matrices, one slot a job of the weights' staging buffer: the copy is a job's (9.1 MB), the
     // wait is the batch's - the per-job plan synchronized a job, which is the other half of its ~22 us a pick
-    for (const Plan& p : plans) {
-        for (int k : p.jobs) {
-            const strata_peer_job& j = jobs[k];
-            if (j.resident != 0) continue;
-            const Copy c = copy_of(j);
-            if (hipMemcpyAsync(w.d_w + p.woff, j.gate, (size_t) j.gate_bytes, hipMemcpyHostToDevice, s) !=
-                    hipSuccess ||
-                hipMemcpyAsync(w.d_w + p.woff + c.up_at, j.up, (size_t) j.gate_bytes, hipMemcpyHostToDevice,
-                                s) != hipSuccess ||
-                hipMemcpyAsync(w.d_w + p.woff + c.down_at, j.down, (size_t) j.down_bytes,
-                                hipMemcpyHostToDevice, s) != hipSuccess) {
-                err = "the expert's rows did not reach this card";
-                return false;
-            }
+    for (int k = 0; k < n; ++k) {
+        if (take[(size_t) k] == 0 || jobs[k].resident != 0) continue;
+        // (a host job's own slot: the group reads grp_blob[k], which was handed its slot above - a plan's jobs are not
+        //  one slot, they are one launch: copying them all into the plan's first slot left every group but the first
+        //  reading a slot nothing had written)
+        uint8_t* const slot = (uint8_t*) (uintptr_t) grp_blob[(size_t) k];
+        const Copy c = copy_of(jobs[k]);
+        if (hipMemcpyAsync(slot, jobs[k].gate, (size_t) jobs[k].gate_bytes, hipMemcpyHostToDevice, s) != hipSuccess ||
+            hipMemcpyAsync(slot + c.up_at, jobs[k].up, (size_t) jobs[k].gate_bytes, hipMemcpyHostToDevice, s) !=
+                hipSuccess ||
+            hipMemcpyAsync(slot + c.down_at, jobs[k].down, (size_t) jobs[k].down_bytes, hipMemcpyHostToDevice,
+                            s) != hipSuccess) {
+            err = "the expert's rows did not reach this card";
+            return false;
         }
     }
     // the plan's own arrays in one block, one copy a batch: grp_ptr (a group's blob), grp_start (its first and last
@@ -479,6 +485,16 @@ bool serve(const strata_peer_job* jobs, int n, const std::vector<char>& take, st
             err = "the plan did not reach this card";
             return false;
         }
+    }
+    if (std::getenv("STRATA_PEER_COMPUTE_DEBUG") != nullptr) {
+        const char* const h = w.h_plan;
+        const auto* const ptr = (const unsigned long long*) (h + ptr_at);
+        const auto* const start = (const int*) (h + start_at);
+        std::fprintf(stderr, "  start:");
+        for (int g = 0; g <= n; ++g) std::fprintf(stderr, " %d", start[g]);
+        std::fprintf(stderr, "\n  ptr:");
+        for (int g = 0; g < n; ++g) std::fprintf(stderr, " 0x%llx", ptr[g]);
+        std::fprintf(stderr, "\n");
     }
     // gate/up for every plan (the engine's own call, so the same sums), then the batch's down activation, then down
     // for every plan, then the routing weights: a geometry their grids cannot cover answers false here, before anything
@@ -594,6 +610,15 @@ int strata_peer_compute_run(void* worker, const strata_peer_job* jobs, int n, ui
     if (worker == nullptr || jobs == nullptr || ok == nullptr || n <= 0) return 1;
     Worker& w = *(Worker*) worker;
     std::lock_guard<std::mutex> lk(w.mu);
+    // THE DAEMON'S CURRENT DEVICE IS NOT THIS WORKER'S: two workers live in one process (one a card), each with the
+    // stream it made at open - and a stream, a copy and a launch mean the card they were made on.  Launched with
+    // another card current, a batch answers hipErrorInvalidResourceHandle and the async copies around it fault the
+    // context (which then fails even a hipMalloc).  Every call below is this worker's card, so it is made current here.
+    if (hipSetDevice(w.dev) != hipSuccess) {
+        std::fprintf(stderr, "strata-peer-compute-hip: hipSetDevice(%d) failed (%s) - no batch on this worker\n", w.dev,
+                     hipGetErrorString(hipGetLastError()));
+        return 1;
+    }
     for (int k = 0; k < n; ++k) ok[k] = 0;
     std::string err;
     // the batch's plan, a job at a time: which jobs this worker takes (a job it cannot serve is the caller's own
@@ -670,6 +695,21 @@ int strata_peer_compute_run(void* worker, const strata_peer_job* jobs, int n, ui
         }
     }
     std::vector<char> served((size_t) n, 0);
+    if (std::getenv("STRATA_PEER_COMPUTE_DEBUG") != nullptr) {   // (the batch's shape, as the worker reads it)
+        std::fprintf(stderr, "strata-peer-compute-hip: debug: %d jobs, %zu rows, %zu plans\n", n, rows_total,
+                     plans.size());
+        for (size_t pi = 0; pi < plans.size(); ++pi) {
+            std::fprintf(stderr, "  plan %zu: first %d, woff %zu, ne_max %zu, tr %zu/%zu/%zu, jobs", pi, plans[pi].first,
+                         plans[pi].woff, plans[pi].ne_max, plans[pi].key.tr[0], plans[pi].key.tr[1],
+                         plans[pi].key.tr[2]);
+            for (int k : plans[pi].jobs) std::fprintf(stderr, " %d(row %d blob 0x%llx)", k, grp_row[(size_t) k],
+                                                      grp_blob[(size_t) k]);
+            std::fprintf(stderr, "\n");
+        }
+        std::fprintf(stderr, "  grp_of:");
+        for (int k = 0; k < n; ++k) std::fprintf(stderr, " %d", grp_of[(size_t) k]);
+        std::fprintf(stderr, "\n");
+    }
     if (!plans.empty()) {
         // (a card that cannot take the batch's scratch answers nothing: every ok stays 0 and the caller computes them)
         if ((wcopy_bytes != 0 && !w.need(w.d_w, w.w_cap, wcopy_bytes, "the host jobs' weights", err)) ||
@@ -684,6 +724,27 @@ int strata_peer_compute_run(void* worker, const strata_peer_job* jobs, int n, ui
     if (st != hipSuccess) {
         std::fprintf(stderr, "strata-peer-compute-hip: a batch failed on GPU %d: %s\n", w.dev,
                      hipGetErrorString(st));
+        // (what the batch held, so a fault names its own addresses: a resident job's three rows are separate
+        //  cache entries - not one contiguous expert blob - and each is read through its own offset in the plan)
+        std::fprintf(stderr,
+                     "strata-peer-compute-hip: the batch was %d jobs, %zu rows, act_cap %zu (xq %zu B), plan_cap %zu, "
+                     "%zu plans\n",
+                     n, rows_total, w.act_cap, (size_t) (rows_total * (size_t) plans[0].key.n_embd), w.plan_cap,
+                     plans.size());
+        for (int k = 0; k < n; ++k) {
+            if (take[(size_t) k] == 0) continue;
+            hipPointerAttribute_t pa{};
+            const bool known = hipPointerGetAttributes(&pa, (void*) grp_blob[(size_t) k]) == hipSuccess;
+            std::fprintf(stderr,
+                         "strata-peer-compute-hip: job %d resident=%d rows=%d tg=%d td=%d E=%d FF=%d gate_bytes=%zu "
+                         "down_bytes=%zu gate=%p up=%p down=%p blob=0x%llx (device %d, base %p) tr=%zu/%zu/%zu\n",
+                         k, jobs[k].resident, jobs[k].n_rows, jobs[k].tg, jobs[k].td, jobs[k].n_embd, jobs[k].n_ff,
+                         (size_t) jobs[k].gate_bytes, (size_t) jobs[k].down_bytes, (const void*) jobs[k].gate,
+                         (const void*) jobs[k].up, (const void*) jobs[k].down,
+                         (unsigned long long) grp_blob[(size_t) k], known ? (int) pa.device : -1,
+                         known ? pa.devicePointer : nullptr, tr[(size_t) k * 3], tr[(size_t) k * 3 + 1],
+                         tr[(size_t) k * 3 + 2]);
+        }
         for (int k = 0; k < n; ++k) ok[k] = 0;
         return 1;
     }

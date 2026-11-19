@@ -181,6 +181,17 @@ pid_t start_daemon(const std::string& bin, const std::string& pack, const std::s
     // (small slabs: one GiB of pinned RAM in 256 MiB arenas, and a VRAM slab of exactly one expert's three rows -
     //  the worker is told which card to compute on and the slab lives on that card, so the two are one card)
     const std::string vram = gpu + ":" + std::to_string(kVramGb);
+    // (STRATA_PEER_TEST_TWO_SLABS=1: the shape the engine puts this worker in - TWO cards, a slab each and a worker
+    //  each, so a resident job lives on one card's slab and the other card's worker must refuse it.  Slab 1 is small
+    //  on purpose: the fixture's first expert fills it, the second spills into slab 0, one expert a card.)
+    if (std::getenv("STRATA_PEER_TEST_TWO_SLABS") != nullptr) {
+        const std::string other = gpu == "0" ? "1" : "0";
+        execl(bin.c_str(), "strata-peer", "--pack", pack.c_str(), "--bind", "0.0.0.0", "--port",
+              std::to_string(port).c_str(), "--ram-gb", "1", "--arena-mb", "256", "--vram",
+              (gpu + ":0.01").c_str(), "--vram", (other + ":0.03").c_str(),
+              "--compute", so.c_str(), "--compute-options", ("gpu:" + gpu).c_str(),
+              "--compute", so.c_str(), "--compute-options", ("gpu:" + other).c_str(), (char*) nullptr);
+    }
     execl(bin.c_str(), "strata-peer", "--pack", pack.c_str(), "--bind", "0.0.0.0", "--port",
           std::to_string(port).c_str(), "--ram-gb", "1", "--arena-mb", "256", "--vram", vram.c_str(),
           "--compute", so.c_str(), "--compute-options", ("gpu:" + gpu).c_str(), (char*) nullptr);
@@ -345,6 +356,70 @@ int main() {
         }
     }
 
+    // ---- (a2) A LAYER'S WORTH: eight orders in one message, four picks of each expert, and every order its own two
+    //      activation rows - a row or a weight landing on the wrong group shows as a sum that is not its own.
+    {
+        const int nJo = 8;
+        std::vector<int8_t> xq_big((size_t) nJo * kRows * kNEmbd);
+        std::vector<float> xd_big((size_t) nJo * kRows * (kNEmbd / 32));
+        std::vector<float> refj((size_t) nJo * kRows * kNEmbd);
+        std::vector<float> xrow((size_t) kRows * kNEmbd);
+        for (int j = 0; j < nJo; ++j) {
+            for (int t = 0; t < kRows; ++t) {
+                for (int i = 0; i < kNEmbd; ++i)   // (a pattern of its own, a job and a row)
+                    xrow[(size_t) t * kNEmbd + (size_t) i] = (float) ((double) pattern((size_t) (j * 97 + t * 31 + i * 7)) / 128.0 - 1.0);
+            }
+            quant_rows(xrow.data(), kNEmbd,
+                       xq_big.data() + (size_t) j * kRows * kNEmbd,
+                       xd_big.data() + (size_t) j * kRows * (kNEmbd / 32));
+            // (the second row's scales and bytes: quant_rows quantizes one row, so the second goes the same way)
+            quant_rows(xrow.data() + kNEmbd, kNEmbd,
+                       xq_big.data() + (size_t) j * kRows * kNEmbd + kNEmbd,
+                       xd_big.data() + (size_t) j * kRows * (kNEmbd / 32) + (kNEmbd / 32));
+        }
+        for (int j = 0; j < nJo; ++j) {
+            const int e = j % 2;
+            const uint8_t* g = shard.data() + (size_t) e * kExpertBytes;
+            lane(g, g + kGateBytes, g + 2 * kGateBytes,
+                 xq_big.data() + (size_t) j * kRows * kNEmbd,
+                 xd_big.data() + (size_t) j * kRows * (kNEmbd / 32), w, refj.data() + (size_t) j * kRows * kNEmbd);
+        }
+        std::vector<strata::peer::PeerClient::ComputeReq> jobs((size_t) nJo);
+        for (int j = 0; j < nJo; ++j) {
+            const int e = j % 2;
+            jobs[(size_t) j].gate = 3 * e + 0;
+            jobs[(size_t) j].up = 3 * e + 1;
+            jobs[(size_t) j].down = 3 * e + 2;
+            jobs[(size_t) j].n_embd = kNEmbd;
+            jobs[(size_t) j].n_ff = kNFf;
+            jobs[(size_t) j].tg = kTG;
+            jobs[(size_t) j].td = kTD;
+            jobs[(size_t) j].n_rows = kRows;
+            jobs[(size_t) j].xq = xq_big.data() + (size_t) j * kRows * kNEmbd;
+            jobs[(size_t) j].xd = xd_big.data() + (size_t) j * kRows * (kNEmbd / 32);
+            jobs[(size_t) j].w = w;
+        }
+        std::vector<char> ok;
+        std::vector<std::vector<float>> y;
+        const bool sent = cli.compute(jobs, ok, y, err);
+        check(sent && ok.size() == (size_t) nJo, "a batch of eight orders was answered" + (sent ? "" : " (" + err + ")"));
+        int served_n = 0, agree = 0;
+        for (int j = 0; sent && j < nJo && (size_t) j < ok.size(); ++j) {
+            if (ok[(size_t) j] != 1) continue;
+            ++served_n;
+            const std::vector<float> want(refj.begin() + (long) ((size_t) j * kRows * kNEmbd),
+                                          refj.begin() + (long) ((size_t) (j + 1) * kRows * kNEmbd));
+            const double rel = y[(size_t) j].size() == want.size() ? worst_rel(y[(size_t) j], want) : -1.0;
+            const double nrel = y[(size_t) j].size() == want.size() ? norm_rel(y[(size_t) j], want) : -1.0;
+            std::printf("      (order %d: its own sums, norms %.3g, worst %.3g)\n", j, nrel, rel);
+            if (nrel < 1e-1) ++agree;
+        }
+        check(served_n == nJo, "all eight of a layer's orders were served (" + std::to_string(served_n) + " of " +
+                                   std::to_string(nJo) + ")");
+        check(agree == nJo, "and each carries its own expert's sums (" + std::to_string(agree) + " of " +
+                                std::to_string(nJo) + ")");
+    }
+
     // ---- (b) the same order on the expert the slab spilled into RAM: served, and its sums against the lane's
     {
         std::vector<strata::peer::PeerClient::ComputeReq> jobs(1);
@@ -371,6 +446,56 @@ int main() {
             check(nrel < 1e-1 && rel < 45e-2,
                   "and its sums agree with the local lane's (norms within 10%, the worst element within 45%)");
         }
+    }
+
+    // ---- (b2) TWO host rows in one message (the expert whose rows spilled into the RAM slab, twice): one plan, two
+    //      slots - each order's sums must be its own, which is what a copy into the plan's single slot used to break
+    {
+        const int nJo = 2;
+        std::vector<int8_t> xq2((size_t) nJo * kRows * kNEmbd);
+        std::vector<float> xd2((size_t) nJo * kRows * (kNEmbd / 32));
+        std::vector<float> refj((size_t) nJo * kRows * kNEmbd);
+        std::vector<float> xrow2((size_t) kRows * kNEmbd);
+        for (int j = 0; j < nJo; ++j) {
+            for (int t = 0; t < kRows; ++t)
+                for (int i = 0; i < kNEmbd; ++i)
+                    xrow2[(size_t) t * kNEmbd + (size_t) i] =
+                        (float) ((double) pattern((size_t) (j * 53 + t * 19 + i * 11)) / 128.0 - 1.0);
+            for (int t = 0; t < kRows; ++t)
+                quant_rows(xrow2.data() + (size_t) t * kNEmbd, kNEmbd,
+                           xq2.data() + (size_t) j * kRows * kNEmbd + (size_t) t * kNEmbd,
+                           xd2.data() + (size_t) j * kRows * (kNEmbd / 32) + (size_t) t * (kNEmbd / 32));
+            lane(shard.data() + kExpertBytes, shard.data() + kExpertBytes + kGateBytes,
+                 shard.data() + kExpertBytes + 2 * kGateBytes, xq2.data() + (size_t) j * kRows * kNEmbd,
+                 xd2.data() + (size_t) j * kRows * (kNEmbd / 32), w,
+                 refj.data() + (size_t) j * kRows * kNEmbd);
+        }
+        std::vector<strata::peer::PeerClient::ComputeReq> jobs((size_t) nJo);
+        for (int j = 0; j < nJo; ++j) {
+            jobs[(size_t) j].gate = 3;
+            jobs[(size_t) j].up = 4;
+            jobs[(size_t) j].down = 5;
+            jobs[(size_t) j].n_embd = kNEmbd;
+            jobs[(size_t) j].n_ff = kNFf;
+            jobs[(size_t) j].tg = kTG;
+            jobs[(size_t) j].td = kTD;
+            jobs[(size_t) j].n_rows = kRows;
+            jobs[(size_t) j].xq = xq2.data() + (size_t) j * kRows * kNEmbd;
+            jobs[(size_t) j].xd = xd2.data() + (size_t) j * kRows * (kNEmbd / 32);
+            jobs[(size_t) j].w = w;
+        }
+        std::vector<char> ok;
+        std::vector<std::vector<float>> y;
+        const bool sent = cli.compute(jobs, ok, y, err);
+        int agree = 0;
+        for (int j = 0; sent && j < nJo && (size_t) j < ok.size(); ++j) {
+            if (ok[(size_t) j] != 1) continue;
+            const std::vector<float> want(refj.begin() + (long) ((size_t) j * kRows * kNEmbd),
+                                          refj.begin() + (long) ((size_t) (j + 1) * kRows * kNEmbd));
+            if (y[(size_t) j].size() == want.size() && norm_rel(y[(size_t) j], want) < 1e-1) ++agree;
+        }
+        check(sent && ok.size() == (size_t) nJo && ok[0] == 1 && ok[1] == 1, "two host rows in one message were served");
+        check(agree == nJo, "and each carries its own sums (" + std::to_string(agree) + " of 2)");
     }
 
     // ---- (c) an order naming a row the daemon does not hold: 0 for it, its neighbour served

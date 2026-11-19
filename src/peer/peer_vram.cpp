@@ -192,6 +192,12 @@ public:
 
     bool put(size_t off, const void* src, size_t bytes, std::string& err) override {
         const Rocm& r = rocm();
+        // (this slab's bytes are its own card's memory: the daemon's current device is the one the last worker or
+        //  slab set, and a copy into another card's pointer with it current is an invalid device pointer)
+        if (r.set_device(gpu_) != kHipOk) {
+            err = "hipSetDevice(" + std::to_string(gpu_) + ") failed before a VRAM row";
+            return false;
+        }
         const int st = r.memcpy((char*) buf_ + off, src, bytes, kHipMemcpyHostToDevice);
         if (st != kHipOk) {
             err = "hipMemcpy of " + std::to_string(bytes) + " bytes into VRAM failed: " + hip_why(st);

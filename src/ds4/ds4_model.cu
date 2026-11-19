@@ -4920,6 +4920,57 @@ struct Model::Impl {
                                     }
                                     c.layers.push_back(ls);
                                 }
+                                // (--peer-compute) THE COMPUTE TIER AND ITS RESIDENCY: this run takes the worker's
+                                // half (--peer-compute, or MAYA_DS4_PEER_COMPUTE, which peer-tier.sh sets), and asks
+                                // the daemon to keep the experts a decode is likeliest to pick resident at hello.  The
+                                // tier truncates that list where the peer's slab runs out (ds4_peer_tier.cpp), so the
+                                // order IS the ranking and this machine's own hit profile is the estimate.
+                                if (o.peer_compute || (env("STRATA_DS4_PEER_COMPUTE", "MAYA_DS4_PEER_COMPUTE") != nullptr &&
+                                                       std::atoi(env("STRATA_DS4_PEER_COMPUTE", "MAYA_DS4_PEER_COMPUTE")) != 0))
+                                    c.compute = true;
+                                if (c.compute) {
+                                    struct Hot {
+                                        uint32_t hits;
+                                        int il, e;
+                                    };
+                                    std::vector<Hot> hot;
+                                    for (size_t il = 0; il < L.size(); ++il) {   // (the layers the row table serves)
+                                        const Layer& l = L[il];
+                                        if (l.mtp || l.lay.fmt != gg::kFmtMXFP4 || l.n_exp <= 0) continue;
+                                        const uint32_t* pr = prof.size() >= ((size_t) l.il + 1) * (size_t) g.n_exp
+                                                                 ? prof.data() + (size_t) l.il * (size_t) g.n_exp
+                                                                 : nullptr;
+                                        for (int e = 0; e < l.n_exp; ++e)
+                                            hot.push_back(Hot{pr != nullptr ? pr[e] : 0u, (int) il, e});
+                                    }
+                                    std::sort(hot.begin(), hot.end(), [](const Hot& a, const Hot& b) {
+                                        if (a.hits != b.hits) return a.hits > b.hits;
+                                        return a.il != b.il ? a.il < b.il : a.e < b.e;
+                                    });
+                                    // the row table's own numbering (base[layer] + expert * 3 + role), so the list is
+                                    // rows, not experts: an expert's three parts stay together in it
+                                    std::vector<long long> lbase(L.size(), -1);
+                                    long long row = 0;
+                                    for (size_t il = 0; il < L.size(); ++il)
+                                        if (c.layers[il].n_exp > 0) {
+                                            lbase[il] = row;
+                                            row += c.layers[il].n_exp * (long long) PeerTier::kRoles;
+                                        }
+                                    double hot_bytes = 0;
+                                    for (const Hot& h : hot) {
+                                        if (lbase[(size_t) h.il] < 0) continue;
+                                        for (int r = 0; r < PeerTier::kRoles; ++r)
+                                            c.resident.push_back(lbase[(size_t) h.il] +
+                                                                 (long long) h.e * (long long) PeerTier::kRoles + r);
+                                        for (int r = 0; r < PeerTier::kRoles; ++r)
+                                            hot_bytes += (double) mx_part_bytes(L[(size_t) h.il], r);
+                                    }
+                                    std::fprintf(stderr,
+                                                 "ds4 peer: %zu experts may be held resident (%.1f GB of rows), the "
+                                                 "most-routed first off this machine's profile - the peer's own slab "
+                                                 "decides how many\n",
+                                                 hot.size(), hot_bytes / 1e9);
+                                }
                                 std::string perr;
                                 ptier = PeerTier::open_session(c, perr);
                                 pc_on = ptier != nullptr && ptier->compute_on();
@@ -15430,6 +15481,25 @@ struct Model::Impl {
                 // worker will not take - puts the picks straight back here and they are computed as always: a peer's
                 // no may cost a lane's time, never an expert's contribution.
                 pc_ords.clear();
+                {   // (MAYA_DS4_PC_DEBUG=1, ONE line at the gate): the conjuncts as they stand for the first layer
+                    //  asked, and how many of that layer's picks the peer could take (0: its rows are not resident,
+                    //  or it has no worker; -1: there is no tier or no pick).  A tier that hands nothing over answers here.
+                    static bool pc_dbg = std::getenv("MAYA_DS4_PC_DEBUG") != nullptr;
+                    if (pc_dbg) {
+                        pc_dbg = false;
+                        int comp = -1;
+                        if (pc_tier != nullptr && !picks.empty()) {
+                            comp = 0;
+                            for (const auto& pk_ : picks) comp += pc_tier->computable((int64_t) li, pk_.first) ? 1 : 0;
+                        }
+                        std::fprintf(stderr,
+                                     "ds4 pc gate: pc_on=%d tier=%d il=%d nm=%d mtp=%d n_exp=%d T=%d cap=%d layer_ok=%d "
+                                     "par_layer=%d picks=%zu computable=%d\n",
+                                     (int) pc_on, pc_tier != nullptr, li, l.nm, (int) l.mtp, l.n_exp, T, Chunk::kPcMaxTokens,
+                                     pc_tier != nullptr && pc_layer_ok(l),
+                                     (int) (lane_par && lane_par_layer(l)), picks.size(), comp);
+                    }
+                }
                 const bool pc_here = pc_on && pc_tier != nullptr && !l.mtp && T <= Chunk::kPcMaxTokens && pc_layer_ok(l) &&
                                      !(lane_par && lane_par_layer(l));
                 if (pc_here && !picks.empty()) {

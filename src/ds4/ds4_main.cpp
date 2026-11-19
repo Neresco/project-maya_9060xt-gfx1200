@@ -132,8 +132,9 @@ void usage() {
                  "           [--vision on|off] [--mmap-experts on|off|auto] [--experts N (lossy: the router's top N)]\n"
                  "           [--parallel N (--serve: N conversations at once)]\n"
                  "           [--ssd-cache GB|auto|off [--ssd-policy lru|lfu]]   (the in-place experts in a RAM store; opt-in)\n"
-                 "           [--peer HOST [--peer-port N] [--peer-device IBV] [--peer-shards 0,1,...]]   (the experts the\n"
-                 "            other machine's strata-peer serves over RoCE: the pack files IT holds, as the pack numbers them)\n"
+                 "           [--peer HOST [--peer-port N] [--peer-device IBV] [--peer-shards 0,1,...] [--peer-compute]]\n"
+                 "            (the experts the other machine's strata-peer serves over RoCE - the pack files IT holds, as\n"
+                 "            the pack numbers them - and, with --peer-compute, computes for this one: docs/PEER_COMPUTE.md)\n"
                  "           [--ablate DIRECTION.gguf|ADAPTER.gguf [--ablate-layer N] [--ablate-scale F]]\n"
                  "           (--ids I,J,... | @FILE [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n"
@@ -3632,6 +3633,7 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--peer-device") o.peer_device = val("--peer-device");
+        else if (a == "--peer-compute") o.peer_compute = true;   // (the peer's worker sums the experts it holds)
         else if (a == "--peer-shards") {
             for (int s : parse_ids(val("--peer-shards"))) {
                 if (s < 0) {
