@@ -5906,6 +5906,144 @@ struct Model::Impl {
               "; CUDA reports a kernel's fault at a later launch - CUDA_LAUNCH_BLOCKING=1 names the kernel that faulted)"
               " - then: " + err;
     }
+    // The activations' handoff at a layer split's GPU boundary.  The copy is the one point where a split's layers
+    // meet: a copy that does not land leaves the next GPU's layers reading zeros.  A peer copy is the fast path, but
+    // a pair cannot be trusted to perform one: beside a Radeon 8060S an RX 7600 XT's copy into the APU's own memory
+    // answers success and lands nothing (measured: every destination row zero, both the async and the blocking form),
+    // while the same copy the other way round lands.  So every pair is probed once with real data, in each way the
+    // copy can be queued, and the first one that lands is kept for that pair:
+    //   kHandDst  the copy on the destination's stream (CUDA's rule)      kHandSrc  on the source's stream (ROCm's)
+    //   kHandHost through host memory, always right and slower            kHandSync the blocking cudaMemcpyPeer
+    // HY4_HANDOFF=peer|host|sync forces one way (tests); HY4_HANDOFF_LOG=1 says each copy's pair, way and size;
+    // HY4_HANDOFF_CHECK=n reads the first n copies back on both sides and compares them (a 4 MiB sample, the first
+    // wrong index named).
+    enum { kHandDst = 0, kHandSrc = 1, kHandHost = 2, kHandSync = 3 };
+    const int handoff_forced = [] {
+        const char* m = std::getenv("HY4_HANDOFF");
+        if (m == nullptr) return -1;
+        if (std::strcmp(m, "host") == 0) return (int) kHandHost;
+        if (std::strcmp(m, "sync") == 0) return (int) kHandSync;
+        if (std::strcmp(m, "peer") == 0) return (int) kHandDst;
+        return -1;
+    }();
+    int handoff_check = [] {
+        const char* v = std::getenv("HY4_HANDOFF_CHECK");
+        return v ? std::atoi(v) : 0;
+    }();
+    const bool handoff_log = std::getenv("HY4_HANDOFF_LOG") != nullptr;
+    std::vector<float> handoff_host;
+    std::map<std::pair<int, int>, int> handoff_way;   // (the source's device, the destination's) -> its way
+    // Does a copy from pg to gp land, queued this way?  A pattern goes into the source, the destination is zeroed, the
+    // copy made, and the destination read back - the only answer worth acting on.
+    int handoff_probe(Gpu& gp, Gpu& pg, int how, std::string& err) {
+        const size_t n = 1 << 16;   // (256 KiB a way: the copy either lands or does not)
+        float *a = nullptr, *b = nullptr;
+        std::vector<float> h(n), back(n);
+        bool ok = false;
+        cudaError_t e = cudaSuccess;
+        for (size_t i = 0; i < n; ++i) h[i] = (float) (i % 251) + 0.5f;   // (a pattern, not a constant: an untouched
+        if (cudaSetDevice(pg.dev) != cudaSuccess) return -1;               //  buffer is zeros, a half-copy is neither)
+        e = cudaMalloc(&a, n * sizeof(float));
+        if (e == cudaSuccess && cudaSetDevice(gp.dev) == cudaSuccess) e = cudaMalloc(&b, n * sizeof(float));
+        if (e == cudaSuccess && cudaSetDevice(pg.dev) == cudaSuccess)
+            e = cudaMemcpy(a, h.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+        if (e == cudaSuccess && cudaSetDevice(gp.dev) == cudaSuccess) e = cudaMemsetAsync(b, 0, n * sizeof(float), gp.s);
+        if (e == cudaSuccess) e = cudaStreamSynchronize(gp.s);
+        if (e == cudaSuccess) {
+            if (how == kHandSync) e = cudaMemcpyPeer(b, gp.dev, a, pg.dev, n * sizeof(float));
+            else if (how == kHandSrc) e = cudaMemcpyPeerAsync(b, gp.dev, a, pg.dev, n * sizeof(float), pg.s);
+            else e = cudaMemcpyPeerAsync(b, gp.dev, a, pg.dev, n * sizeof(float), gp.s);
+        }
+        if (e == cudaSuccess && how == kHandDst) e = cudaStreamSynchronize(gp.s);
+        if (e == cudaSuccess && how == kHandSrc && cudaSetDevice(pg.dev) == cudaSuccess) e = cudaStreamSynchronize(pg.s);
+        if (e == cudaSuccess && cudaSetDevice(gp.dev) == cudaSuccess)
+            e = cudaMemcpy(back.data(), b, n * sizeof(float), cudaMemcpyDeviceToHost);
+        if (e == cudaSuccess) {
+            ok = true;
+            for (size_t i = 0; i < n && ok; ++i) ok = back[i] == h[i];
+        }
+        if (b != nullptr) {
+            (void) cudaSetDevice(gp.dev);
+            (void) cudaFree(b);
+        }
+        if (a != nullptr) {
+            (void) cudaSetDevice(pg.dev);
+            (void) cudaFree(a);
+        }
+        (void) cudaSetDevice(gp.dev);
+        if (!ok) return -1;
+        return how;
+    }
+    bool handoff(Gpu& gp, Gpu& pg, size_t bytes, std::string& err) {
+        const std::pair<int, int> key{pg.dev, gp.dev};
+        int way;
+        auto it = handoff_way.find(key);
+        if (it != handoff_way.end()) {
+            way = it->second;
+        } else {   // (a pair's first copy: which way lands, measured once)
+            way = -1;
+            if (handoff_forced >= 0) {
+                way = handoff_forced == kHandHost || handoff_forced == kHandSync
+                          ? handoff_forced
+                          : handoff_probe(gp, pg, handoff_forced, err);
+            } else {
+                for (int how : {(int) kHandDst, (int) kHandSrc, (int) kHandSync}) {
+                    way = handoff_probe(gp, pg, how, err);
+                    if (way >= 0) break;
+                }
+            }
+            if (way < 0) way = kHandHost;
+            handoff_way[key] = way;
+            static const char* kNames[] = {"the destination's stream", "the source's stream", "host memory",
+                                           "a blocking copy"};
+            std::fprintf(stderr, "INFO handoff: dev %d <- dev %d copies through %s\n", gp.dev, pg.dev, kNames[way]);
+        }
+        if (handoff_log) std::fprintf(stderr, "HANDOFF dev %d <- dev %d: %zu bytes, way %d\n", gp.dev, pg.dev, bytes, way);
+        switch (way) {
+            case kHandSync:
+                CK(cudaMemcpyPeer(gp.x, gp.dev, pg.x, pg.dev, bytes));
+                break;
+            case kHandSrc:   // (queued on the source's stream: its own sync waits for the copy, the rows are then there
+                CK(cudaSetDevice(pg.dev));                     //  before the destination's first kernel is queued - the
+                CK(cudaMemcpyPeerAsync(gp.x, gp.dev, pg.x, pg.dev, bytes, pg.s));   //  wait costs what the copy costs)
+                CK(cudaStreamSynchronize(pg.s));
+                CK(cudaSetDevice(gp.dev));
+                break;
+            case kHandHost:
+                handoff_host.resize(bytes / sizeof(float));
+                CK(cudaSetDevice(pg.dev));
+                CK(cudaMemcpyAsync(handoff_host.data(), pg.x, bytes, cudaMemcpyDeviceToHost, pg.s));
+                CK(cudaStreamSynchronize(pg.s));
+                CK(cudaSetDevice(gp.dev));
+                CK(cudaMemcpyAsync(gp.x, handoff_host.data(), bytes, cudaMemcpyHostToDevice, gp.s));
+                break;
+            default:
+                CK(cudaMemcpyPeerAsync(gp.x, gp.dev, pg.x, pg.dev, bytes, gp.s));
+                break;
+        }
+        if (handoff_check > 0) {   // (the sample read back on both sides: the destination's rows against the source's)
+            --handoff_check;
+            CK(cudaStreamSynchronize(gp.s));
+            const size_t n = std::min<size_t>(bytes / sizeof(float), (size_t) (1 << 20));
+            std::vector<float> a(n), b(n);
+            CK(cudaSetDevice(pg.dev));
+            CK(cudaStreamSynchronize(pg.s));
+            CK(cudaMemcpy(a.data(), pg.x, n * sizeof(float), cudaMemcpyDeviceToHost));
+            CK(cudaSetDevice(gp.dev));
+            CK(cudaMemcpy(b.data(), gp.x, n * sizeof(float), cudaMemcpyDeviceToHost));
+            size_t bad = 0, first = n;
+            for (size_t i = 0; i < n; ++i)
+                if (a[i] != b[i]) {
+                    if (bad++ == 0) first = i;
+                }
+            std::fprintf(stderr, "HANDOFF dev %d <- dev %d, %zu bytes: %zu of %zu sampled differ", gp.dev, pg.dev, bytes,
+                         bad, n);
+            if (bad) std::fprintf(stderr, ", first %zu: %.6f vs %.6f", first, a[first], b[first]);
+            std::fprintf(stderr, "\n");
+            CK(cudaSetDevice(gp.dev));
+        }
+        return true;
+    }
     bool window(const int* ids, int T, int64_t p0, int want, float* logits_out, std::string& err) {
         const int E = g.n_embd, hc = g.hc;
         win_t0 = now_s();
@@ -5964,7 +6102,7 @@ struct Model::Impl {
                 } else {
                     Gpu& pg = G[(size_t) cur];
                     CK(cudaStreamSynchronize(pg.s));
-                    CK(cudaMemcpyPeerAsync(gp.x, gp.dev, pg.x, pg.dev, sizeof(float) * T * hc * E, gp.s));
+                    if (!handoff(gp, pg, sizeof(float) * T * hc * E, err)) return false;
                 }
                 cur = l.gpu;
             }
@@ -6011,7 +6149,7 @@ struct Model::Impl {
             Gpu& pg = G[(size_t) cur];
             CK(cudaStreamSynchronize(pg.s));
             CK(cudaMemcpyAsync(hg.pos, h_pos, sizeof(int) * 3 * Tc, cudaMemcpyHostToDevice, hg.s));
-            CK(cudaMemcpyPeerAsync(hg.x, hg.dev, pg.x, pg.dev, sizeof(float) * T * hc * E, hg.s));
+            if (!handoff(hg, pg, sizeof(float) * T * hc * E, err)) return false;
         }
         if (!head_tail(ids, T, p0, want, logits_out, err)) return false;
         CK(cudaStreamSynchronize(hg.s));
