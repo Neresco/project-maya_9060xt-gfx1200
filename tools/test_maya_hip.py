@@ -58,8 +58,19 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(maya.EXE, self.root / "build-hip/maya")
 
     def test_rx_9060_xt_is_a_supported_discrete_card(self):
-        """gfx1200 (RX 9050 / 9060 XT): RDNA4 like the gfx1201 R9700, no hipBLASLt table yet (plain hipBLAS)."""
+        """gfx1200 (RX 9050 / 9060 XT): RDNA4 like the gfx1201 R9700, with its own GLM hipBLASLt tables."""
         card = {"index": 0, "arch": "gfx1200", "vendor": "amd", "name": "AMD Radeon RX 9060 XT", "vram_gb": 16}
+        with patch.object(maya.S, "amd_gpus", return_value=[card]):
+            self.a.gpu = None
+            pc = maya.check_pc(self.a)
+        self.assertEqual(pc["gpus"], [card])
+        self.assertEqual(pc["backend"], "hip")
+        self.assertFalse(maya.hip_unified_memory(card))
+
+    def test_rx_7600_xt_is_a_supported_discrete_card(self):
+        """gfx1102 (RX 7600 / 7600 XT): RDNA3 wave32 beside gfx1100/gfx1201/gfx1151, with the gfx1102 GLM
+        hipBLASLt table at 100401."""
+        card = {"index": 0, "arch": "gfx1102", "vendor": "amd", "name": "AMD Radeon RX 7600 XT", "vram_gb": 16}
         with patch.object(maya.S, "amd_gpus", return_value=[card]):
             self.a.gpu = None
             pc = maya.check_pc(self.a)
@@ -148,6 +159,24 @@ class HipSetupTests(unittest.TestCase):
         self.assertNotIn("MAYA_GLM_SPLIT", cfg["env"])
         self.assertEqual(cfg["env"]["MAYA_HIPBLASLT_TUNING"],
                          f"{tables / 'gfx1201-glm-hipblaslt-100202.txt'}{os.pathsep}{tables / 'gfx1100-glm-hipblaslt-100202.txt'}")
+
+    def test_gfx1200_card_takes_both_of_its_shipped_tables(self):
+        """An RX 9060 XT ships tables for hipBLASLt 100202 and 100401: setup offers both, in version order, so the
+        engine takes the one its installed hipBLASLt accepts (100401 is the one tuned on the card)."""
+        tables = self.root / "tools/hip"
+        tables.mkdir(parents=True)
+        for version in ("100202", "100401"):
+            (tables / f"gfx1200-glm-hipblaslt-{version}.txt").write_text(
+                f"MAYA_HIPBLASLT_TUNING_V1 gfx1200 {version}\n")
+        card = {"index": 0, "arch": "gfx1200", "vendor": "amd", "name": "AMD Radeon RX 9060 XT", "vram_gb": 16}
+        with patch.object(maya.S, "amd_gpus", return_value=[card]):
+            self.a.gpu = None
+            pc = maya.check_pc(self.a)
+        p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
+                              self.root / "pack", "test", 8192, self.root / "data", None)
+        self.assertEqual(maya.read_json(p)["env"]["MAYA_HIPBLASLT_TUNING"].split(os.pathsep),
+                         [str(tables / "gfx1200-glm-hipblaslt-100202.txt"),
+                          str(tables / "gfx1200-glm-hipblaslt-100401.txt")])
 
     def test_config_selects_hip_and_preserves_user_tuning(self):
         pc = maya.check_pc(self.a)
