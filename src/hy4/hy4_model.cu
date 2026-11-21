@@ -3135,6 +3135,10 @@ struct Model::Impl {
             }
             eg_table = pk.data(*tt);
             eg_bytes = tt->bytes;
+            // a looked-up row is 1-2 KB at a hashed offset: the kernel's readahead pulls windows of pages no one
+            // asked for (the DS4 Engram reader's MAYA_DS4_EG_RANDOM, here on by default; HY4_EG_RANDOM=0 keeps it)
+            if (!(std::getenv("HY4_EG_RANDOM") && std::atoi(std::getenv("HY4_EG_RANDOM")) == 0))
+                mm3::os::random_mapped(eg_table, eg_bytes);
             if (pk.has("engram_eps")) eg_eps = (float) pk.num("engram_eps");
             if (const char* ee = std::getenv("HY4_ENGRAM_EPS")) eg_eps = (float) std::atof(ee);
             if (!(eg_eps > 0.0f) || eg_eps > 1.0f) {
@@ -5925,7 +5929,11 @@ struct Model::Impl {
         //  or, with tensor parallel, beside the members' launches: window_tp)
         if (!eg_wait) {
             if (n_look >= 8 && T > W && !std::getenv("HY4_EG_SERIAL")) {
-                if (!eg_crew) eg_crew = std::make_unique<Crew>(8);
+                static const int eg_threads = [] {   // (HY4_EG_THREADS: the lookups' queue depth; 8 unless asked)
+                    const char* v = std::getenv("HY4_EG_THREADS");
+                    return std::min(64, std::max(1, v ? std::atoi(v) : 8));
+                }();
+                if (!eg_crew) eg_crew = std::make_unique<Crew>(eg_threads);
                 const int nt = eg_crew->size();
                 eg_crew->start([&](int w) {
                     for (int i = w; i < n_look; i += nt) engram_row(i / T, i % T, p0);
